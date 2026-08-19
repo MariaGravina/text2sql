@@ -14,8 +14,15 @@ import json
 import uuid
 import warnings
 
+# Forza oracledb ad usare SOLO la modalità Thin in Python puro (evita errori di blocco DLL su Windows)
+os.environ["PYORACLEDB_THIN_MODE"] = "1"
+
 import streamlit as st
 import oracledb
+
+# Mantiene la modalità Thin nativa
+oracledb.init_oracle_client = None
+
 from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import create_sql_agent
@@ -29,8 +36,6 @@ def apri_porta_firewall(porta: int = 8501):
     """
     Tenta di creare automaticamente una regola nel Firewall di Windows per
     permettere le connessioni in ingresso da altri PC della rete locale.
-    Funziona solo se lo script è avviato come Amministratore; altrimenti
-    fallisce silenziosamente e stampa le istruzioni manuali nel terminale.
     """
     import platform
     import subprocess
@@ -40,7 +45,6 @@ def apri_porta_firewall(porta: int = 8501):
 
     nome_regola = "Streamlit App"
     try:
-        # Controlla se la regola esiste già, per non duplicarla ad ogni avvio
         check = subprocess.run(
             ["netsh", "advfirewall", "firewall", "show", "rule", f"name={nome_regola}"],
             capture_output=True, text=True, timeout=5,
@@ -60,12 +64,7 @@ def apri_porta_firewall(porta: int = 8501):
             print(f"✅ Regola firewall per la porta {porta} già presente.")
     except Exception:
         print(
-            f"⚠️  Non sono riuscito ad aprire automaticamente la porta {porta} nel firewall "
-            "(probabilmente lo script non è avviato come Amministratore).\n"
-            "Se altri PC della rete non riescono a raggiungere l'app, apri PowerShell "
-            "come Amministratore su questo PC ed esegui:\n\n"
-            f'    New-NetFirewallRule -DisplayName "Streamlit 8501" -Direction Inbound '
-            f'-LocalPort {porta} -Protocol TCP -Action Allow\n'
+            f"⚠️  Non sono riuscito ad aprire automaticamente la porta {porta} nel firewall.\n"
         )
 
 
@@ -77,7 +76,7 @@ apri_porta_firewall()
 REQUIRED_ENV_VARS = ["GOOGLE_API_KEY", "ORACLE_ADMIN_PASSWORD", "ORACLE_WALLET_PASSWORD"]
 _mancanti = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
 if _mancanti:
-    st.error(f"❌ Variabili mancanti nel file .env: {', '.join(_mancanti)}")
+    st.error(f"❌ Variabili mancanti nel file .env o nei Secrets: {', '.join(_mancanti)}")
     st.stop()
 
 DB_USER = "ADMIN"
@@ -86,14 +85,9 @@ WALLET_PASSWORD = os.environ["ORACLE_WALLET_PASSWORD"]
 DSN = "text2sqldb_high"
 WALLET_DIR = os.path.abspath("Wallet_text2sqldb")
 
-# Due modelli, per bilanciare velocità e qualità:
-# - MODEL_SIMPLE: usato per classificare l'intento ed estrarre i campi. Compiti
-#   semplici a singolo passaggio, dove conta soprattutto la velocità.
-# - MODEL_AGENT: usato dall'agente SQL, che deve ragionare su schema/JOIN/query
-#   in più passaggi: qui serve più capacità di ragionamento.
-# Verifica su Google AI Studio se questi nomi cambiano in futuro.
-MODEL_SIMPLE = "gemini-3.5-flash-lite"
-MODEL_AGENT = "gemini-3.6-flash"
+# Modelli Gemini con piano Free esteso
+MODEL_SIMPLE = "gemini-2.5-flash-lite"
+MODEL_AGENT = "gemini-2.0-flash"
 
 
 # =========================================================
@@ -157,11 +151,7 @@ def get_table_columns(table_name: str):
 
 
 def execute_insert(table_name: str, fields: dict):
-    """
-    Esegue un INSERT parametrizzato e sicuro (bind variables).
-    Valori None/stringa vuota diventano NULL. Ogni colonna è validata
-    contro lo schema reale prima di essere usata nella query.
-    """
+    """Esegue un INSERT parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -193,11 +183,7 @@ def execute_insert(table_name: str, fields: dict):
 
 
 def execute_update(table_name: str, set_fields: dict, where_fields: dict):
-    """
-    Esegue un UPDATE parametrizzato e sicuro. Richiede almeno una condizione
-    WHERE (non è mai permesso un UPDATE senza filtro, per evitare di
-    modificare l'intera tabella per errore).
-    """
+    """Esegue un UPDATE parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -244,7 +230,7 @@ def execute_update(table_name: str, set_fields: dict, where_fields: dict):
 
 
 def count_matching(table_name: str, where_fields: dict) -> int:
-    """Conta quante righe soddisfano una condizione, usata per l'anteprima prima di un DELETE."""
+    """Conta quante righe soddisfano una condizione."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -276,11 +262,7 @@ def count_matching(table_name: str, where_fields: dict) -> int:
 
 
 def execute_delete(table_name: str, where_fields: dict):
-    """
-    Esegue un DELETE parametrizzato e sicuro. Richiede sempre almeno una
-    condizione WHERE: un DELETE senza filtro (che cancellerebbe l'intera
-    tabella) non è mai permesso da questa funzione.
-    """
+    """Esegue un DELETE parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -315,14 +297,13 @@ def execute_delete(table_name: str, where_fields: dict):
 
 
 # =========================================================
-# GEMINI: classificazione intento + estrazione campi (no SQL diretto)
+# GEMINI: classificazione intento + estrazione campi
 # =========================================================
 def _llm(model=None):
     return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE, temperature=0)
 
 
 def _testo(content):
-    """Normalizza l'output del modello (stringa o lista di blocchi) in testo semplice."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -332,11 +313,6 @@ def _testo(content):
 
 
 def analizza_richiesta(domanda: str, tabelle_disponibili: list) -> dict:
-    """
-    Un'unica chiamata a Gemini che classifica l'intento, identifica la tabella
-    coinvolta ed estrae campi/condizioni, tutto insieme (invece di 3 chiamate
-    separate), per ridurre drasticamente i tempi di risposta.
-    """
     elenco = ", ".join(tabelle_disponibili)
     prompt = f"""Sei un assistente che analizza una richiesta in linguaggio naturale su un database
 Oracle di dati clinici cardiologici.
@@ -359,10 +335,8 @@ Regole:
 - "insert": l'utente vuole aggiungere una nuova riga. Usa "campi" per i valori forniti, "where" vuoto.
 - "update": l'utente vuole modificare righe esistenti. Usa "campi" per i nuovi valori, "where" per identificare le righe.
 - "delete": l'utente vuole eliminare righe esistenti. Usa "where" per identificare le righe, "campi" vuoto.
-- "altro": la richiesta NON riguarda questo database (saluti generici, chiacchiere, argomenti non pertinenti,
-  domande di cultura generale). In questo caso "tabella" è null e "campi"/"where" sono vuoti.
+- "altro": la richiesta NON riguarda questo database (saluti generici, chiacchiere, argomenti non pertinenti).
 - Per "read" imposta comunque "tabella" a null e lascia "campi"/"where" vuoti.
-- La condizione "where" deve identificare le righe nel modo più univoco possibile (es. un codice paziente).
 - Non inventare valori non menzionati dall'utente."""
 
     risposta = _llm().invoke(prompt)
@@ -386,19 +360,17 @@ Regole:
 
 
 # =========================================================
-# AGENTE DI SOLA LETTURA (SELECT, anche con JOIN)
+# AGENTE DI SOLA LETTURA (SELECT)
 # =========================================================
 PREFIX_PROMPT = """Sei un agente SQL esperto per un database Oracle, specializzato in dati clinici cardiologici.
 Rispondi sempre in italiano, in modo chiaro e comprensibile anche per un utente non tecnico.
 Sei abilitato SOLO a leggere dati (SELECT), anche con JOIN, aggregazioni, filtri e sotto-query complesse.
 Prima di eseguire una query su una tabella, verifica sempre la struttura delle tabelle rilevanti (colonne, tipi).
 Se la domanda è ambigua, fai la scelta più ragionevole e spiega brevemente l'assunzione fatta nella risposta finale.
-Se una query fallisce, correggila e riprova prima di arrenderti.
 """
 
 
 def estrai_testo_risposta(output):
-    """Gestisce sia risposte come stringa semplice sia come lista di blocchi strutturati."""
     if isinstance(output, str):
         return output
     if isinstance(output, list):
@@ -438,7 +410,6 @@ st.set_page_config(page_title="Text2SQL - Oracle AI Agent", page_icon="🤖", la
 
 st.markdown("""
     <style>
-    /* Sfondo generale bianco con testo nero, ovunque tranne le bolle della chat */
     html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] * ,
     [data-testid="stSidebar"], [data-testid="stSidebar"] * {
         color: #000000 !important;
@@ -446,7 +417,6 @@ st.markdown("""
     [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stSidebar"] {
         background-color: #FFFFFF !important;
     }
-    /* Dentro le bolle della chat: sfondo scuro, testo bianco */
     [data-testid="stChatMessage"] * { color: #FFFFFF !important; }
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         flex-direction: row-reverse !important;
@@ -466,15 +436,12 @@ st.markdown("""
         margin-left: 10px !important;
         margin-right: 0px !important;
     }
-
-    /* Pulsanti primari (sfondo colorato/scuro): testo bianco per contrasto */
     button[kind="primary"], button[kind="primaryFormSubmit"] {
         color: #FFFFFF !important;
     }
     button[kind="primary"] *, button[kind="primaryFormSubmit"] * {
         color: #FFFFFF !important;
     }
-
     </style>
 """, unsafe_allow_html=True)
 
@@ -550,7 +517,6 @@ with col_head2:
     if st.button("🛑 Termina Sessione", use_container_width=True):
         nuova_chat("Sessione precedente terminata. Nuova conversazione avviata!")
         st.rerun()
-
 
 
 # --- STORICO MESSAGGI ---
@@ -649,7 +615,7 @@ if st.session_state.pending_write:
             if not pw["set"]:
                 st.info("Non ho riconosciuto campi da modificare. Riscrivi la richiesta specificando cosa cambiare.")
             if not pw["where"]:
-                st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe (es. un codice paziente).")
+                st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe.")
 
             c1, c2 = st.columns(2)
             if c1.button("✅ Conferma ed esegui la modifica", use_container_width=True, disabled=not (set_finale and where_finale)):
@@ -680,13 +646,12 @@ if st.session_state.pending_write:
                 where_finale[name] = val
 
             if not pw["where"]:
-                st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe da eliminare (es. un codice paziente). Un'eliminazione senza condizione non è permessa.")
+                st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe da eliminare.")
             else:
                 try:
                     conteggio = count_matching(pw["table"], where_finale)
-                    st.warning(f"Questa condizione corrisponde a **{conteggio} riga/e**. Verranno eliminate tutte, senza possibilità di annullare dopo la conferma.")
+                    st.warning(f"Questa condizione corrisponde a **{conteggio} riga/e**. Verranno eliminate tutte.")
                 except Exception as e:
-                    conteggio = None
                     st.error(f"Impossibile verificare l'anteprima: {e}")
 
             conferma_esplicita = st.checkbox("Confermo di voler eliminare definitivamente queste righe", key=f"confirm_delete_{st.session_state.current_chat_id}")
@@ -706,7 +671,7 @@ if st.session_state.pending_write:
                 st.session_state.pending_write = None
                 st.rerun()
 
-# --- INPUT UTENTE (stile WhatsApp: testo + microfono + invio sulla stessa riga) ---
+# --- INPUT UTENTE ---
 pending_active = bool(st.session_state.pending_write)
 
 with st.form(key="chat_form", clear_on_submit=True):
@@ -726,32 +691,31 @@ with st.form(key="chat_form", clear_on_submit=True):
             """
             <style>
             .mic-btn {
-                width: 60px;
-                height: 60px;
+                width: 42px;
+                height: 42px;
                 border-radius: 50%;
                 border: none;
                 background-color: #25D366;
                 color: #ffffff;
-                font-size: 28px;
+                font-size: 20px;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                margin: 4px auto;
-                transition: transform 0.15s ease, box-shadow 0.15s ease;
+                margin: 0 auto;
             }
-            .mic-btn:hover { transform: scale(1.05); }
             .mic-btn.recording {
                 background-color: #E8677D;
                 animation: mic-glow 1s infinite;
             }
             @keyframes mic-glow {
-                0%   { box-shadow: 0 0 0 6px rgba(232, 103, 125, 0.35), 0 0 16px 4px rgba(232, 103, 125, 0.55); }
-                50%  { box-shadow: 0 0 0 12px rgba(232, 103, 125, 0.20), 0 0 30px 10px rgba(232, 103, 125, 0.85); }
-                100% { box-shadow: 0 0 0 6px rgba(232, 103, 125, 0.35), 0 0 16px 4px rgba(232, 103, 125, 0.55); }
+                0%   { box-shadow: 0 0 0 4px rgba(232, 103, 125, 0.35); }
+                50%  { box-shadow: 0 0 0 8px rgba(232, 103, 125, 0.55); }
+                100% { box-shadow: 0 0 0 4px rgba(232, 103, 125, 0.35); }
             }
-            body { margin: 0; display: flex; justify-content: center; }
+            body { margin: 0; display: flex; justify-content: center; align-items: center; }
             </style>
+            <button id="micButton" type="button" class="mic-btn" onclick="startDictation()" title="Parla con il microfono">🎤</button>
             <script>
             function startDictation() {
                 const btn = document.getElementById('micButton');
@@ -761,110 +725,80 @@ with st.form(key="chat_form", clear_on_submit=True):
                     recognition.interimResults = false;
                     recognition.lang = "it-IT";
 
-                    recognition.onstart = function() {
-                        if (btn) btn.classList.add('recording');
-                    };
-                    recognition.onend = function() {
-                        if (btn) btn.classList.remove('recording');
-                    };
-                    recognition.onerror = function(e) {
-                        if (btn) btn.classList.remove('recording');
-                        recognition.stop();
-                    };
+                    recognition.onstart = function() { if (btn) btn.classList.add('recording'); };
+                    recognition.onend = function() { if (btn) btn.classList.remove('recording'); };
+                    recognition.onerror = function() { if (btn) btn.classList.remove('recording'); };
                     recognition.onresult = function(e) {
                         var transcript = e.results[0][0].transcript;
-                        recognition.stop();
-                        const inputBox = window.parent.document.querySelector('input[aria-label="Messaggio"]');
-                        if (inputBox) {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                            setter.call(inputBox, transcript);
-                            inputBox.dispatchEvent(new Event('input', { bubbles: true }));
+                        var input = window.parent.document.querySelector('input[placeholder="Fai una domanda o chiedi una modifica al database..."]');
+                        if (input) {
+                            input.value = transcript;
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
                         }
                     };
                     recognition.start();
                 } else {
-                    alert("Riconoscimento vocale non supportato in questo browser. Usa Google Chrome o Edge.");
+                    alert('Il riconoscimento vocale non è supportato da questo browser.');
                 }
             }
             </script>
-            <button id="micButton" class="mic-btn" onclick="startDictation()" title="Dettatura vocale">🎤</button>
             """,
-            height=75,
+            height=45,
         )
 
     with c_send:
-        submitted = st.form_submit_button("➤", disabled=pending_active, use_container_width=True)
+        submit = st.form_submit_button("Invia", type="primary", use_container_width=True, disabled=pending_active)
 
-prompt = user_msg.strip() if (submitted and user_msg and user_msg.strip()) else None
+if submit and user_msg.strip():
+    current_messages.append({"role": "user", "content": user_msg})
 
-if prompt:
-    current_messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    with st.spinner("Elaborazione della richiesta in corso..."):
+        try:
+            tabelle = get_allowed_tables()
+            analisi = analizza_richiesta(user_msg, tabelle)
+            intento = analisi["intento"]
+            tabella = analisi["tabella"]
 
-    with st.chat_message("assistant"):
-        with st.spinner("Elaborazione in corso..."):
-            try:
-                tabelle = get_allowed_tables()
-                analisi = analizza_richiesta(prompt, tabelle)
-                intento = analisi["intento"]
+            if intento == "altro":
+                risposta = "Non riesco ad elaborare questa richiesta. Posso aiutarti solo con consultazioni e modifiche al database Oracle."
+                current_messages.append({"role": "assistant", "content": risposta})
 
-                if intento == "altro":
-                    testo = (
-                        "Sono un assistente pensato per interrogare e gestire il database clinico "
-                        "(anagrafica pazienti, esami, visite, coronarografie, ecc.). "
-                        "La tua domanda non sembra riguardare questi dati: prova a chiedermi qualcosa "
-                        "sul database, ad esempio una ricerca, una statistica o una modifica."
-                    )
-                    st.markdown(testo)
-                    current_messages.append({"role": "assistant", "content": testo})
+            elif intento in ("insert", "update", "delete"):
+                if not tabella or tabella.upper() not in [t.upper() for t in tabelle]:
+                    current_messages.append({
+                        "role": "assistant",
+                        "content": f"Non ho identificato una tabella valida per questa operazione. Tabelle disponibili: {', '.join(tabelle)}"
+                    })
+                else:
+                    tabella_real = [t for t in tabelle if t.upper() == tabella.upper()][0]
+                    if intento == "insert":
+                        cols = get_table_columns(tabella_real)
+                        st.session_state.pending_write = {
+                            "operation": "insert",
+                            "table": tabella_real,
+                            "columns": cols,
+                            "provided": analisi["campi"],
+                        }
+                    elif intento == "update":
+                        st.session_state.pending_write = {
+                            "operation": "update",
+                            "table": tabella_real,
+                            "set": analisi["campi"],
+                            "where": analisi["where"],
+                        }
+                    elif intento == "delete":
+                        st.session_state.pending_write = {
+                            "operation": "delete",
+                            "table": tabella_real,
+                            "where": analisi["where"],
+                        }
 
-                elif intento == "read":
-                    risposta = agent.invoke({"input": prompt})
-                    testo = estrai_testo_risposta(risposta["output"])
-                    st.markdown(testo)
-                    current_messages.append({"role": "assistant", "content": testo})
+            else:  # 'read'
+                res = agent.invoke({"input": user_msg})
+                output_text = estrai_testo_risposta(res.get("output", ""))
+                current_messages.append({"role": "assistant", "content": output_text})
 
-                elif intento == "insert":
-                    tabella = analisi["tabella"] or tabelle[0]
-                    colonne = get_table_columns(tabella)
-                    nomi_validi = {c["name"] for c in colonne}
-                    campi_forniti = {k.upper().strip(): v for k, v in analisi["campi"].items() if k.upper().strip() in nomi_validi}
-
-                    riepilogo = f"Ho preparato un inserimento nella tabella **{tabella}** con i dati che ho riconosciuto. Controlla e conferma qui sotto."
-                    st.markdown(riepilogo)
-                    current_messages.append({"role": "assistant", "content": riepilogo})
-
-                    st.session_state.pending_write = {
-                        "operation": "insert",
-                        "table": tabella,
-                        "provided": campi_forniti,
-                        "columns": colonne,
-                    }
-
-                else:  # update o delete
-                    tabella = analisi["tabella"] or tabelle[0]
-                    colonne = get_table_columns(tabella)
-                    nomi_validi = {c["name"] for c in colonne}
-                    set_forniti = {k.upper().strip(): v for k, v in analisi["campi"].items() if k.upper().strip() in nomi_validi}
-                    where_forniti = {k.upper().strip(): v for k, v in analisi["where"].items() if k.upper().strip() in nomi_validi}
-
-                    verbo = "una modifica" if intento == "update" else "un'eliminazione"
-                    riepilogo = f"Ho preparato {verbo} sulla tabella **{tabella}**. Controlla i dettagli e conferma qui sotto."
-                    st.markdown(riepilogo)
-                    current_messages.append({"role": "assistant", "content": riepilogo})
-
-                    st.session_state.pending_write = {
-                        "operation": intento,
-                        "table": tabella,
-                        "set": set_forniti,
-                        "where": where_forniti,
-                        "columns": colonne,
-                    }
-
-            except Exception as e:
-                errore = f"⚠️ Errore durante l'elaborazione: {e}"
-                st.markdown(errore)
-                current_messages.append({"role": "assistant", "content": errore})
+        except Exception as e:
+            current_messages.append({"role": "assistant", "content": f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"})
 
     st.rerun()

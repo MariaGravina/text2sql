@@ -1,3 +1,11 @@
-venv/
-dataset_csv/
+# File di configurazione con chiavi e password
 .env
+
+# Cartella del Wallet Oracle con i certificati
+Wallet_text2sqldb/
+
+# Cache di Python e ambienti virtuali
+__pycache__/
+*.pyc
+.venv/
+env/
