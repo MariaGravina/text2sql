@@ -1,20 +1,26 @@
 """
 Text2SQL Assistant — Streamlit, file unico.
 
-Richiede nella stessa cartella:
-  - un file .env con GOOGLE_API_KEY, ORACLE_ADMIN_PASSWORD, ORACLE_WALLET_PASSWORD
-  - la cartella Wallet_text2sqldb (wallet Oracle)
+Richiede:
+  - In locale: file .env con GOOGLE_API_KEY, ORACLE_ADMIN_PASSWORD, ORACLE_WALLET_PASSWORD
+  - Su Streamlit Cloud: Secrets configurati con le stesse chiavi + ORACLE_WALLET_BASE64
 
-Avvio: streamlit run app.py
+Avvio locale: streamlit run app.py
 """
 
 import os
 import re
 import json
 import uuid
+import base64
+import zipfile
 import warnings
+from dotenv import load_dotenv
 
-# Forza oracledb ad usare SOLO la modalità Thin in Python puro (evita errori di blocco DLL su Windows)
+# Load env variables early
+load_dotenv()
+
+# Forza oracledb ad usare SOLO la modalità Thin in Python puro
 os.environ["PYORACLEDB_THIN_MODE"] = "1"
 
 import streamlit as st
@@ -23,13 +29,30 @@ import oracledb
 # Mantiene la modalità Thin nativa
 oracledb.init_oracle_client = None
 
-from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 warnings.filterwarnings("ignore")
-load_dotenv()
+
+# =========================================================
+# GESTIONE WALLET PER STREAMLIT CLOUD
+# =========================================================
+WALLET_DIR_NAME = "Wallet_text2sqldb"
+
+# Se la cartella del wallet non esiste (es. su Streamlit Cloud), la ricrea da Base64
+if not os.path.exists(WALLET_DIR_NAME):
+    wallet_b64 = st.secrets.get("ORACLE_WALLET_BASE64") or os.environ.get("ORACLE_WALLET_BASE64")
+    if wallet_b64:
+        os.makedirs(WALLET_DIR_NAME, exist_ok=True)
+        zip_path = "temp_wallet.zip"
+        with open(zip_path, "wb") as f:
+            f.write(base64.b64decode(wallet_b64))
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(WALLET_DIR_NAME)
+        os.remove(zip_path)
+
+WALLET_DIR = os.path.abspath(WALLET_DIR_NAME)
 
 
 def apri_porta_firewall(porta: int = 8501):
@@ -41,7 +64,7 @@ def apri_porta_firewall(porta: int = 8501):
     import subprocess
 
     if platform.system() != "Windows":
-        return  # rilevante solo su Windows
+        return
 
     nome_regola = "Streamlit App"
     try:
@@ -70,20 +93,40 @@ def apri_porta_firewall(porta: int = 8501):
 
 apri_porta_firewall()
 
+
+# Helper per recuperare chiavi da Secrets o da .env
+def get_secret(key: str) -> str:
+    if key in st.secrets:
+        return st.secrets[key]
+    return os.environ.get(key, "")
+
+
 # =========================================================
 # CONFIGURAZIONE
 # =========================================================
-REQUIRED_ENV_VARS = ["GOOGLE_API_KEY", "ORACLE_ADMIN_PASSWORD", "ORACLE_WALLET_PASSWORD"]
-_mancanti = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
+ORACLE_ADMIN_PASSWORD = get_secret("ORACLE_ADMIN_PASSWORD")
+ORACLE_WALLET_PASSWORD = get_secret("ORACLE_WALLET_PASSWORD")
+
+if GOOGLE_API_KEY:
+    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+
+_mancanti = []
+if not GOOGLE_API_KEY:
+    _mancanti.append("GOOGLE_API_KEY")
+if not ORACLE_ADMIN_PASSWORD:
+    _mancanti.append("ORACLE_ADMIN_PASSWORD")
+if not ORACLE_WALLET_PASSWORD:
+    _mancanti.append("ORACLE_WALLET_PASSWORD")
+
 if _mancanti:
     st.error(f"❌ Variabili mancanti nel file .env o nei Secrets: {', '.join(_mancanti)}")
     st.stop()
 
 DB_USER = "ADMIN"
-DB_PASSWORD = os.environ["ORACLE_ADMIN_PASSWORD"]
-WALLET_PASSWORD = os.environ["ORACLE_WALLET_PASSWORD"]
+DB_PASSWORD = ORACLE_ADMIN_PASSWORD
+WALLET_PASSWORD = ORACLE_WALLET_PASSWORD
 DSN = "text2sqldb_high"
-WALLET_DIR = os.path.abspath("Wallet_text2sqldb")
 
 # Modelli Gemini con piano Free esteso
 MODEL_SIMPLE = "gemini-2.5-flash-lite"
