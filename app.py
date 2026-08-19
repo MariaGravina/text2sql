@@ -24,6 +24,53 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 warnings.filterwarnings("ignore")
 load_dotenv()
 
+
+def apri_porta_firewall(porta: int = 8501):
+    """
+    Tenta di creare automaticamente una regola nel Firewall di Windows per
+    permettere le connessioni in ingresso da altri PC della rete locale.
+    Funziona solo se lo script è avviato come Amministratore; altrimenti
+    fallisce silenziosamente e stampa le istruzioni manuali nel terminale.
+    """
+    import platform
+    import subprocess
+
+    if platform.system() != "Windows":
+        return  # rilevante solo su Windows
+
+    nome_regola = "Streamlit App"
+    try:
+        # Controlla se la regola esiste già, per non duplicarla ad ogni avvio
+        check = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={nome_regola}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "No rules match" in check.stdout or check.returncode != 0:
+            subprocess.run(
+                [
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name={nome_regola}",
+                    "dir=in", "action=allow", "protocol=TCP",
+                    f"localport={porta}",
+                ],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            print(f"✅ Regola firewall creata automaticamente per la porta {porta}.")
+        else:
+            print(f"✅ Regola firewall per la porta {porta} già presente.")
+    except Exception:
+        print(
+            f"⚠️  Non sono riuscito ad aprire automaticamente la porta {porta} nel firewall "
+            "(probabilmente lo script non è avviato come Amministratore).\n"
+            "Se altri PC della rete non riescono a raggiungere l'app, apri PowerShell "
+            "come Amministratore su questo PC ed esegui:\n\n"
+            f'    New-NetFirewallRule -DisplayName "Streamlit 8501" -Direction Inbound '
+            f'-LocalPort {porta} -Protocol TCP -Action Allow\n'
+        )
+
+
+apri_porta_firewall()
+
 # =========================================================
 # CONFIGURAZIONE
 # =========================================================
@@ -39,10 +86,14 @@ WALLET_PASSWORD = os.environ["ORACLE_WALLET_PASSWORD"]
 DSN = "text2sqldb_high"
 WALLET_DIR = os.path.abspath("Wallet_text2sqldb")
 
-# Modello Gemini: gemini-3.5-flash è la versione stabile/legacy (non "Preview"),
-# quindi non soggetta alle quote giornaliere ridotte dei modelli Preview.
-# Verifica su Google AI Studio se in futuro il nome cambia.
-MODEL_NAME = "gemini-3.5-flash"
+# Due modelli, per bilanciare velocità e qualità:
+# - MODEL_SIMPLE: usato per classificare l'intento ed estrarre i campi. Compiti
+#   semplici a singolo passaggio, dove conta soprattutto la velocità.
+# - MODEL_AGENT: usato dall'agente SQL, che deve ragionare su schema/JOIN/query
+#   in più passaggi: qui serve più capacità di ragionamento.
+# Verifica su Google AI Studio se questi nomi cambiano in futuro.
+MODEL_SIMPLE = "gemini-3.5-flash-lite"
+MODEL_AGENT = "gemini-3.6-flash"
 
 
 # =========================================================
@@ -141,11 +192,133 @@ def execute_insert(table_name: str, fields: dict):
         conn.close()
 
 
+def execute_update(table_name: str, set_fields: dict, where_fields: dict):
+    """
+    Esegue un UPDATE parametrizzato e sicuro. Richiede almeno una condizione
+    WHERE (non è mai permesso un UPDATE senza filtro, per evitare di
+    modificare l'intera tabella per errore).
+    """
+    table_name = table_name.upper().strip()
+    columns_info = get_table_columns(table_name)
+    valid_columns = {c["name"] for c in columns_info}
+
+    def _clean(fields):
+        out = {}
+        for raw_name, raw_value in fields.items():
+            name = raw_name.upper().strip()
+            if name not in valid_columns:
+                raise ValueError(f"Colonna non valida per la tabella {table_name}: {raw_name}")
+            value = None if raw_value in (None, "", "NULL", "null") else raw_value
+            out[name] = value
+        return out
+
+    clean_set = _clean(set_fields)
+    clean_where = _clean(where_fields)
+
+    if not clean_set:
+        raise ValueError("Nessun campo da modificare specificato.")
+    if not clean_where:
+        raise ValueError("Nessuna condizione WHERE specificata: un UPDATE senza filtro non è permesso.")
+
+    set_cols = list(clean_set.keys())
+    where_cols = list(clean_where.keys())
+
+    set_clause = ", ".join(f"{c} = :{i + 1}" for i, c in enumerate(set_cols))
+    where_clause = " AND ".join(
+        f"{c} IS NULL" if clean_where[c] is None else f"{c} = :{len(set_cols) + i + 1}"
+        for i, c in enumerate(where_cols)
+    )
+    sql = f"UPDATE {table_name} SET {set_clause} WHERE {where_clause}"
+
+    values = [clean_set[c] for c in set_cols] + [clean_where[c] for c in where_cols if clean_where[c] is not None]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, values)
+        righe = cur.rowcount
+        conn.commit()
+        return sql, righe
+    finally:
+        conn.close()
+
+
+def count_matching(table_name: str, where_fields: dict) -> int:
+    """Conta quante righe soddisfano una condizione, usata per l'anteprima prima di un DELETE."""
+    table_name = table_name.upper().strip()
+    columns_info = get_table_columns(table_name)
+    valid_columns = {c["name"] for c in columns_info}
+
+    clean_where = {}
+    for raw_name, raw_value in where_fields.items():
+        name = raw_name.upper().strip()
+        if name not in valid_columns:
+            raise ValueError(f"Colonna non valida per la tabella {table_name}: {raw_name}")
+        clean_where[name] = None if raw_value in (None, "", "NULL", "null") else raw_value
+
+    if not clean_where:
+        raise ValueError("Nessuna condizione specificata.")
+
+    where_cols = list(clean_where.keys())
+    where_clause = " AND ".join(
+        f"{c} IS NULL" if clean_where[c] is None else f"{c} = :{i + 1}"
+        for i, c in enumerate(where_cols)
+    )
+    values = [clean_where[c] for c in where_cols if clean_where[c] is not None]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {where_clause}", values)
+        return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def execute_delete(table_name: str, where_fields: dict):
+    """
+    Esegue un DELETE parametrizzato e sicuro. Richiede sempre almeno una
+    condizione WHERE: un DELETE senza filtro (che cancellerebbe l'intera
+    tabella) non è mai permesso da questa funzione.
+    """
+    table_name = table_name.upper().strip()
+    columns_info = get_table_columns(table_name)
+    valid_columns = {c["name"] for c in columns_info}
+
+    clean_where = {}
+    for raw_name, raw_value in where_fields.items():
+        name = raw_name.upper().strip()
+        if name not in valid_columns:
+            raise ValueError(f"Colonna non valida per la tabella {table_name}: {raw_name}")
+        clean_where[name] = None if raw_value in (None, "", "NULL", "null") else raw_value
+
+    if not clean_where:
+        raise ValueError("Nessuna condizione WHERE specificata: un DELETE senza filtro non è permesso.")
+
+    where_cols = list(clean_where.keys())
+    where_clause = " AND ".join(
+        f"{c} IS NULL" if clean_where[c] is None else f"{c} = :{i + 1}"
+        for i, c in enumerate(where_cols)
+    )
+    values = [clean_where[c] for c in where_cols if clean_where[c] is not None]
+    sql = f"DELETE FROM {table_name} WHERE {where_clause}"
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, values)
+        righe = cur.rowcount
+        conn.commit()
+        return sql, righe
+    finally:
+        conn.close()
+
+
 # =========================================================
 # GEMINI: classificazione intento + estrazione campi (no SQL diretto)
 # =========================================================
-def _llm():
-    return ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0)
+def _llm(model=None):
+    return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE, temperature=0)
 
 
 def _testo(content):
@@ -158,54 +331,39 @@ def _testo(content):
     return str(content)
 
 
-def classify_intent(domanda: str) -> str:
-    """Ritorna 'write' se la richiesta implica inserire/modificare dati, altrimenti 'read'."""
-    prompt = (
-        "Classifica questa richiesta di un utente su un database Oracle.\n"
-        "Rispondi SOLO con una parola, senza altro testo:\n"
-        "- 'write' se l'utente vuole inserire, aggiungere, modificare, aggiornare o eliminare dati\n"
-        "- 'read' se l'utente vuole solo interrogare/leggere dati (incluse ricerche, conteggi, join, statistiche)\n\n"
-        f'Richiesta: "{domanda}"'
-    )
-    risposta = _llm().invoke(prompt)
-    testo = _testo(risposta.content).strip().lower()
-    return "write" if "write" in testo else "read"
-
-
-def identifica_tabella_target(domanda: str, tabelle_disponibili: list) -> str:
+def analizza_richiesta(domanda: str, tabelle_disponibili: list) -> dict:
+    """
+    Un'unica chiamata a Gemini che classifica l'intento, identifica la tabella
+    coinvolta ed estrae campi/condizioni, tutto insieme (invece di 3 chiamate
+    separate), per ridurre drasticamente i tempi di risposta.
+    """
     elenco = ", ".join(tabelle_disponibili)
-    prompt = (
-        f'Richiesta dell\'utente su un database Oracle: "{domanda}"\n'
-        f"Tabelle disponibili: {elenco}\n\n"
-        "Rispondi SOLO con il nome esatto della tabella più pertinente per questa "
-        "operazione di scrittura, senza altro testo."
-    )
-    risposta = _llm().invoke(prompt)
-    testo = _testo(risposta.content).strip().upper()
-    for t in tabelle_disponibili:
-        if t.upper() in testo:
-            return t
-    return tabelle_disponibili[0]
+    prompt = f"""Sei un assistente che analizza una richiesta in linguaggio naturale su un database
+Oracle di dati clinici cardiologici.
 
-
-def estrai_campi_insert(domanda: str, tabella: str, colonne: list) -> dict:
-    """Estrae {colonna: valore} dai dati che l'utente ha fornito esplicitamente nel testo."""
-    nomi_colonne = ", ".join(c["name"] for c in colonne)
-    prompt = f"""Sei un assistente che estrae dati strutturati da una richiesta in linguaggio naturale,
-per preparare l'inserimento di una nuova riga nella tabella Oracle "{tabella}".
-
-Colonne disponibili in questa tabella: {nomi_colonne}
+Tabelle disponibili: {elenco}
 
 Richiesta dell'utente: "{domanda}"
 
 Rispondi SOLO con un oggetto JSON valido (nessun testo prima o dopo, nessun blocco markdown),
 in questo formato esatto:
-{{"campi": {{"NOME_COLONNA": "valore", ...}}}}
+{{
+  "intento": "read" | "insert" | "update" | "delete" | "altro",
+  "tabella": "NOME_TABELLA_O_NULL",
+  "campi": {{"NOME_COLONNA": "valore", ...}},
+  "where": {{"NOME_COLONNA": "valore", ...}}
+}}
 
 Regole:
-- Includi SOLO le colonne per cui l'utente ha fornito un valore esplicito o chiaramente deducibile dal contesto.
-- Non inventare o dedurre valori per colonne non menzionate.
-- Se non è chiaro alcun valore, rispondi con {{"campi": {{}}}}."""
+- "read": l'utente vuole solo interrogare/leggere dati (ricerche, conteggi, join, statistiche, analisi).
+- "insert": l'utente vuole aggiungere una nuova riga. Usa "campi" per i valori forniti, "where" vuoto.
+- "update": l'utente vuole modificare righe esistenti. Usa "campi" per i nuovi valori, "where" per identificare le righe.
+- "delete": l'utente vuole eliminare righe esistenti. Usa "where" per identificare le righe, "campi" vuoto.
+- "altro": la richiesta NON riguarda questo database (saluti generici, chiacchiere, argomenti non pertinenti,
+  domande di cultura generale). In questo caso "tabella" è null e "campi"/"where" sono vuoti.
+- Per "read" imposta comunque "tabella" a null e lascia "campi"/"where" vuoti.
+- La condizione "where" deve identificare le righe nel modo più univoco possibile (es. un codice paziente).
+- Non inventare valori non menzionati dall'utente."""
 
     risposta = _llm().invoke(prompt)
     testo = _testo(risposta.content).strip()
@@ -213,8 +371,18 @@ Regole:
     try:
         dati = json.loads(testo)
     except json.JSONDecodeError:
-        dati = {"campi": {}}
-    return dati.get("campi", {}) or {}
+        dati = {}
+
+    intento = str(dati.get("intento", "read")).strip().lower()
+    if intento not in ("read", "insert", "update", "delete", "altro"):
+        intento = "read"
+
+    return {
+        "intento": intento,
+        "tabella": dati.get("tabella") or None,
+        "campi": dati.get("campi", {}) or {},
+        "where": dati.get("where", {}) or {},
+    }
 
 
 # =========================================================
@@ -252,7 +420,7 @@ def get_read_agent():
         f"?config_dir={WALLET_DIR}&wallet_location={WALLET_DIR}&wallet_password={encoded_wallet_password}"
     )
     db = SQLDatabase.from_uri(connection_string, sample_rows_in_table_info=2)
-    llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0)
+    llm = ChatGoogleGenerativeAI(model=MODEL_AGENT, temperature=0)
     return create_sql_agent(
         llm=llm,
         db=db,
@@ -299,27 +467,14 @@ st.markdown("""
         margin-right: 0px !important;
     }
 
-    /* Barra di input in stile WhatsApp: input + microfono affiancati */
-    .input-row-mic {
-        display: flex;
-        align-items: center;
-        justify-content: center;
+    /* Pulsanti primari (sfondo colorato/scuro): testo bianco per contrasto */
+    button[kind="primary"], button[kind="primaryFormSubmit"] {
+        color: #FFFFFF !important;
     }
-    .mic-btn {
-        width: 40px;
-        height: 40px;
-        border-radius: 50%;
-        border: none;
-        background-color: #25D366;
-        color: #ffffff;
-        font-size: 18px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        margin-top: 4px;
+    button[kind="primary"] *, button[kind="primaryFormSubmit"] * {
+        color: #FFFFFF !important;
     }
-    .mic-btn.recording { background-color: #E8677D; }
+
     </style>
 """, unsafe_allow_html=True)
 
@@ -336,7 +491,7 @@ if "current_chat_id" not in st.session_state:
     new_id = str(uuid.uuid4())
     st.session_state.current_chat_id = new_id
     st.session_state.all_chats[new_id] = [
-        {"role": "assistant", "content": "Ciao! Sono il tuo assistente Text-to-SQL. Posso eseguire query complesse con JOIN, fare analisi, oppure aiutarti a inserire nuovi dati (con conferma prima di ogni modifica)."}
+        {"role": "assistant", "content": "Ciao! Sono il tuo assistente Text-to-SQL. Posso eseguire query complesse con JOIN, fare analisi, oppure inserire, modificare o eliminare dati — sempre con conferma esplicita prima di ogni modifica."}
     ]
 
 if "pending_write" not in st.session_state:
@@ -427,44 +582,129 @@ for idx, msg in enumerate(current_messages):
 # --- CARD DI CONFERMA PER SCRITTURE IN SOSPESO ---
 if st.session_state.pending_write:
     pw = st.session_state.pending_write
-    with st.chat_message("assistant"):
-        st.warning(f"⚠️ Stai per inserire una nuova riga nella tabella **{pw['table']}**. Controlla i campi prima di confermare.")
+    operazione = pw["operation"]
 
-        valori_finali = {}
-        for col in pw["columns"]:
-            name = col["name"]
-            is_missing = name not in pw["provided"]
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                default_val = "" if is_missing else str(pw["provided"][name])
+    with st.chat_message("assistant"):
+
+        if operazione == "insert":
+            st.warning(f"⚠️ Stai per inserire una nuova riga nella tabella **{pw['table']}**. Controlla i campi prima di confermare.")
+            valori_finali = {}
+            for col in pw["columns"]:
+                name = col["name"]
+                is_missing = name not in pw["provided"]
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    default_val = "" if is_missing else str(pw["provided"][name])
+                    val = st.text_input(
+                        name.lower().replace("_", " "),
+                        value=default_val,
+                        key=f"field_{name}_{st.session_state.current_chat_id}",
+                        disabled=is_missing and st.session_state.get(f"null_{name}_{st.session_state.current_chat_id}", True),
+                    )
+                with col2:
+                    if is_missing:
+                        is_null = st.checkbox("NULL", value=True, key=f"null_{name}_{st.session_state.current_chat_id}")
+                    else:
+                        is_null = False
+                valori_finali[name] = None if is_null else val
+
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Conferma ed esegui l'inserimento", use_container_width=True):
+                try:
+                    sql = execute_insert(pw["table"], valori_finali)
+                    msg = f"Riga inserita correttamente nella tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
+                    current_messages.append({"role": "assistant", "content": msg})
+                except Exception as e:
+                    current_messages.append({"role": "assistant", "content": f"⚠️ Errore durante l'inserimento: {e}"})
+                st.session_state.pending_write = None
+                st.rerun()
+            if c2.button("❌ Annulla", use_container_width=True):
+                current_messages.append({"role": "assistant", "content": "Operazione annullata."})
+                st.session_state.pending_write = None
+                st.rerun()
+
+        elif operazione == "update":
+            st.warning(f"⚠️ Stai per modificare righe nella tabella **{pw['table']}**. Controlla campi e condizione prima di confermare.")
+
+            st.markdown("**Campi da modificare:**")
+            set_finale = {}
+            for name, value in pw["set"].items():
                 val = st.text_input(
                     name.lower().replace("_", " "),
-                    value=default_val,
-                    key=f"field_{name}_{st.session_state.current_chat_id}",
-                    disabled=is_missing and st.session_state.get(f"null_{name}_{st.session_state.current_chat_id}", True),
+                    value=str(value) if value is not None else "",
+                    key=f"set_{name}_{st.session_state.current_chat_id}",
                 )
-            with col2:
-                if is_missing:
-                    is_null = st.checkbox("NULL", value=True, key=f"null_{name}_{st.session_state.current_chat_id}")
-                else:
-                    is_null = False
-            valori_finali[name] = None if is_null else val
+                set_finale[name] = val
 
-        c1, c2 = st.columns(2)
-        if c1.button("✅ Conferma ed esegui l'inserimento", use_container_width=True):
-            try:
-                sql = execute_insert(pw["table"], valori_finali)
-                msg = f"Riga inserita correttamente nella tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
-                current_messages.append({"role": "assistant", "content": msg})
-            except Exception as e:
-                current_messages.append({"role": "assistant", "content": f"⚠️ Errore durante l'inserimento: {e}"})
-            st.session_state.pending_write = None
-            st.rerun()
+            st.markdown("**Condizione (quali righe modificare):**")
+            where_finale = {}
+            for name, value in pw["where"].items():
+                val = st.text_input(
+                    f"dove {name.lower().replace('_', ' ')} =",
+                    value=str(value) if value is not None else "",
+                    key=f"where_{name}_{st.session_state.current_chat_id}",
+                )
+                where_finale[name] = val
 
-        if c2.button("❌ Annulla", use_container_width=True):
-            current_messages.append({"role": "assistant", "content": "Operazione annullata."})
-            st.session_state.pending_write = None
-            st.rerun()
+            if not pw["set"]:
+                st.info("Non ho riconosciuto campi da modificare. Riscrivi la richiesta specificando cosa cambiare.")
+            if not pw["where"]:
+                st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe (es. un codice paziente).")
+
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Conferma ed esegui la modifica", use_container_width=True, disabled=not (set_finale and where_finale)):
+                try:
+                    sql, righe = execute_update(pw["table"], set_finale, where_finale)
+                    msg = f"{righe} riga/e modificata/e nella tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
+                    current_messages.append({"role": "assistant", "content": msg})
+                except Exception as e:
+                    current_messages.append({"role": "assistant", "content": f"⚠️ Errore durante la modifica: {e}"})
+                st.session_state.pending_write = None
+                st.rerun()
+            if c2.button("❌ Annulla", use_container_width=True):
+                current_messages.append({"role": "assistant", "content": "Operazione annullata."})
+                st.session_state.pending_write = None
+                st.rerun()
+
+        elif operazione == "delete":
+            st.error(f"🗑️ Stai per **eliminare definitivamente** righe dalla tabella **{pw['table']}**. Questa operazione non è reversibile.")
+
+            st.markdown("**Condizione (quali righe eliminare):**")
+            where_finale = {}
+            for name, value in pw["where"].items():
+                val = st.text_input(
+                    f"dove {name.lower().replace('_', ' ')} =",
+                    value=str(value) if value is not None else "",
+                    key=f"delwhere_{name}_{st.session_state.current_chat_id}",
+                )
+                where_finale[name] = val
+
+            if not pw["where"]:
+                st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe da eliminare (es. un codice paziente). Un'eliminazione senza condizione non è permessa.")
+            else:
+                try:
+                    conteggio = count_matching(pw["table"], where_finale)
+                    st.warning(f"Questa condizione corrisponde a **{conteggio} riga/e**. Verranno eliminate tutte, senza possibilità di annullare dopo la conferma.")
+                except Exception as e:
+                    conteggio = None
+                    st.error(f"Impossibile verificare l'anteprima: {e}")
+
+            conferma_esplicita = st.checkbox("Confermo di voler eliminare definitivamente queste righe", key=f"confirm_delete_{st.session_state.current_chat_id}")
+
+            c1, c2 = st.columns(2)
+            if c1.button("🗑️ Elimina definitivamente", use_container_width=True, disabled=not (where_finale and conferma_esplicita)):
+                try:
+                    sql, righe = execute_delete(pw["table"], where_finale)
+                    msg = f"{righe} riga/e eliminata/e dalla tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
+                    current_messages.append({"role": "assistant", "content": msg})
+                except Exception as e:
+                    current_messages.append({"role": "assistant", "content": f"⚠️ Errore durante l'eliminazione: {e}"})
+                st.session_state.pending_write = None
+                st.rerun()
+            if c2.button("❌ Annulla", use_container_width=True):
+                current_messages.append({"role": "assistant", "content": "Operazione annullata."})
+                st.session_state.pending_write = None
+                st.rerun()
 
 # --- INPUT UTENTE (stile WhatsApp: testo + microfono + invio sulla stessa riga) ---
 pending_active = bool(st.session_state.pending_write)
@@ -484,14 +724,53 @@ with st.form(key="chat_form", clear_on_submit=True):
     with c_mic:
         st.components.v1.html(
             """
+            <style>
+            .mic-btn {
+                width: 60px;
+                height: 60px;
+                border-radius: 50%;
+                border: none;
+                background-color: #25D366;
+                color: #ffffff;
+                font-size: 28px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin: 4px auto;
+                transition: transform 0.15s ease, box-shadow 0.15s ease;
+            }
+            .mic-btn:hover { transform: scale(1.05); }
+            .mic-btn.recording {
+                background-color: #E8677D;
+                animation: mic-glow 1s infinite;
+            }
+            @keyframes mic-glow {
+                0%   { box-shadow: 0 0 0 6px rgba(232, 103, 125, 0.35), 0 0 16px 4px rgba(232, 103, 125, 0.55); }
+                50%  { box-shadow: 0 0 0 12px rgba(232, 103, 125, 0.20), 0 0 30px 10px rgba(232, 103, 125, 0.85); }
+                100% { box-shadow: 0 0 0 6px rgba(232, 103, 125, 0.35), 0 0 16px 4px rgba(232, 103, 125, 0.55); }
+            }
+            body { margin: 0; display: flex; justify-content: center; }
+            </style>
             <script>
             function startDictation() {
+                const btn = document.getElementById('micButton');
                 if (window.hasOwnProperty('webkitSpeechRecognition')) {
                     var recognition = new webkitSpeechRecognition();
                     recognition.continuous = false;
                     recognition.interimResults = false;
                     recognition.lang = "it-IT";
-                    recognition.start();
+
+                    recognition.onstart = function() {
+                        if (btn) btn.classList.add('recording');
+                    };
+                    recognition.onend = function() {
+                        if (btn) btn.classList.remove('recording');
+                    };
+                    recognition.onerror = function(e) {
+                        if (btn) btn.classList.remove('recording');
+                        recognition.stop();
+                    };
                     recognition.onresult = function(e) {
                         var transcript = e.results[0][0].transcript;
                         recognition.stop();
@@ -502,15 +781,15 @@ with st.form(key="chat_form", clear_on_submit=True):
                             inputBox.dispatchEvent(new Event('input', { bubbles: true }));
                         }
                     };
-                    recognition.onerror = function(e) { recognition.stop(); };
+                    recognition.start();
                 } else {
                     alert("Riconoscimento vocale non supportato in questo browser. Usa Google Chrome o Edge.");
                 }
             }
             </script>
-            <button class="mic-btn" onclick="startDictation()" title="Dettatura vocale">🎤</button>
+            <button id="micButton" class="mic-btn" onclick="startDictation()" title="Dettatura vocale">🎤</button>
             """,
-            height=48,
+            height=75,
         )
 
     with c_send:
@@ -526,31 +805,60 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("Elaborazione in corso..."):
             try:
-                intento = classify_intent(prompt)
+                tabelle = get_allowed_tables()
+                analisi = analizza_richiesta(prompt, tabelle)
+                intento = analisi["intento"]
 
-                if intento == "read":
+                if intento == "altro":
+                    testo = (
+                        "Sono un assistente pensato per interrogare e gestire il database clinico "
+                        "(anagrafica pazienti, esami, visite, coronarografie, ecc.). "
+                        "La tua domanda non sembra riguardare questi dati: prova a chiedermi qualcosa "
+                        "sul database, ad esempio una ricerca, una statistica o una modifica."
+                    )
+                    st.markdown(testo)
+                    current_messages.append({"role": "assistant", "content": testo})
+
+                elif intento == "read":
                     risposta = agent.invoke({"input": prompt})
                     testo = estrai_testo_risposta(risposta["output"])
                     st.markdown(testo)
                     current_messages.append({"role": "assistant", "content": testo})
 
-                else:
-                    tabelle = get_allowed_tables()
-                    tabella = identifica_tabella_target(prompt, tabelle)
+                elif intento == "insert":
+                    tabella = analisi["tabella"] or tabelle[0]
                     colonne = get_table_columns(tabella)
-
-                    campi_grezzi = estrai_campi_insert(prompt, tabella, colonne)
-                    campi_forniti = {k.upper().strip(): v for k, v in campi_grezzi.items()}
                     nomi_validi = {c["name"] for c in colonne}
-                    campi_forniti = {k: v for k, v in campi_forniti.items() if k in nomi_validi}
+                    campi_forniti = {k.upper().strip(): v for k, v in analisi["campi"].items() if k.upper().strip() in nomi_validi}
 
                     riepilogo = f"Ho preparato un inserimento nella tabella **{tabella}** con i dati che ho riconosciuto. Controlla e conferma qui sotto."
                     st.markdown(riepilogo)
                     current_messages.append({"role": "assistant", "content": riepilogo})
 
                     st.session_state.pending_write = {
+                        "operation": "insert",
                         "table": tabella,
                         "provided": campi_forniti,
+                        "columns": colonne,
+                    }
+
+                else:  # update o delete
+                    tabella = analisi["tabella"] or tabelle[0]
+                    colonne = get_table_columns(tabella)
+                    nomi_validi = {c["name"] for c in colonne}
+                    set_forniti = {k.upper().strip(): v for k, v in analisi["campi"].items() if k.upper().strip() in nomi_validi}
+                    where_forniti = {k.upper().strip(): v for k, v in analisi["where"].items() if k.upper().strip() in nomi_validi}
+
+                    verbo = "una modifica" if intento == "update" else "un'eliminazione"
+                    riepilogo = f"Ho preparato {verbo} sulla tabella **{tabella}**. Controlla i dettagli e conferma qui sotto."
+                    st.markdown(riepilogo)
+                    current_messages.append({"role": "assistant", "content": riepilogo})
+
+                    st.session_state.pending_write = {
+                        "operation": intento,
+                        "table": tabella,
+                        "set": set_forniti,
+                        "where": where_forniti,
                         "columns": colonne,
                     }
 
