@@ -349,6 +349,50 @@ def execute_delete(table_name: str, where_fields: dict):
         conn.close()
 
 
+_PAROLE_VIETATE_GRAFICO = ("insert", "update", "delete", "drop", "alter", "truncate", "merge", "grant", "revoke", "create", ";")
+
+
+def genera_query_grafico(domanda: str, tabelle_disponibili: list) -> str:
+    """Chiede al modello una SINGOLA query SELECT di sola lettura, adatta per un grafico (2 colonne: etichetta + valore)."""
+    elenco = ", ".join(tabelle_disponibili)
+    prompt = f"""Sei un assistente Oracle SQL. L'utente vuole un grafico basato su questa richiesta:
+"{domanda}"
+
+Tabelle disponibili: {elenco}
+
+Scrivi UNA SOLA query SQL Oracle di sola lettura (SELECT), che restituisca al massimo 2-3 colonne
+adatte per un grafico: la prima colonna come etichetta/categoria (es. anno, mese, sesso, reparto),
+le successive come valori numerici (es. conteggio, media). Usa GROUP BY e aggregazioni se serve.
+Limita il risultato a un massimo di 50 righe con FETCH FIRST 50 ROWS ONLY.
+
+Rispondi SOLO con la query SQL, senza markdown, senza spiegazioni, senza punto e virgola finale."""
+
+    risposta = _llm().invoke(prompt)
+    query = _testo(risposta.content).strip()
+    query = re.sub(r"^```(sql)?|```$", "", query, flags=re.MULTILINE).strip().rstrip(";")
+    return query
+
+
+def esegui_query_sicura_sola_lettura(query: str):
+    """Esegue una query SOLO se è una singola SELECT, senza parole chiave di scrittura/DDL. Solleva errore altrimenti."""
+    q_lower = query.strip().lower()
+    if not q_lower.startswith("select"):
+        raise ValueError("Solo query di sola lettura (SELECT) sono permesse per i grafici.")
+    for parola in _PAROLE_VIETATE_GRAFICO:
+        if parola in q_lower:
+            raise ValueError(f"Query non permessa: contiene '{parola}'.")
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        colonne = [d[0] for d in cur.description]
+        righe = cur.fetchall()
+        return colonne, righe
+    finally:
+        conn.close()
+
+
 def _llm(model=None):
     return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE, temperature=0)
 
@@ -374,10 +418,11 @@ Richiesta dell'utente: "{domanda}"
 Rispondi SOLO con un oggetto JSON valido (nessun testo prima o dopo, nessun blocco markdown),
 in questo formato esatto:
 {{
-  "intento": "read" | "insert" | "update" | "delete" | "altro",
+  "intento": "read" | "insert" | "update" | "delete" | "grafico" | "altro",
   "tabella": "NOME_TABELLA_O_NULL",
   "campi": {{"NOME_COLONNA": "valore", ...}},
-  "where": {{"NOME_COLONNA": "valore", ...}}
+  "where": {{"NOME_COLONNA": "valore", ...}},
+  "solo_domanda": true | false
 }}
 
 Regole:
@@ -385,8 +430,13 @@ Regole:
 - "insert": l'utente vuole aggiungere una nuova riga. Usa "campi" per i valori forniti, "where" vuoto.
 - "update": l'utente vuole modificare righe esistenti. Usa "campi" per i nuovi valori, "where" per identificare le righe.
 - "delete": l'utente vuole eliminare righe esistenti. Usa "where" per identificare le righe, "campi" vuoto.
+- "grafico": l'utente vuole vedere un grafico/visualizzazione dei dati (es. "mostrami un grafico di...", "andamento nel tempo di...", "distribuzione di...").
 - "altro": la richiesta NON riguarda questo database (saluti generici, chiacchiere, argomenti non pertinenti).
-- Per "read" imposta comunque "tabella" a null e lascia "campi"/"where" vuoti.
+- Per "read" e "grafico" imposta comunque "tabella" a null e lascia "campi"/"where" vuoti.
+- "solo_domanda": metti true SOLO se per insert/update/delete l'utente sta chiedendo informazioni
+  (es. "quali dati servono per inserire un paziente?", "cosa mi serve per modificare un esame?"),
+  SENZA fornire alcun dato reale da inserire/modificare/eliminare. Metti false se l'utente sta
+  effettivamente dando un comando con almeno un dato concreto (anche parziale).
 - Non inventare valori non menzionati dall'utente."""
 
     risposta = _llm().invoke(prompt)
@@ -398,7 +448,7 @@ Regole:
         dati = {}
 
     intento = str(dati.get("intento", "read")).strip().lower()
-    if intento not in ("read", "insert", "update", "delete", "altro"):
+    if intento not in ("read", "insert", "update", "delete", "grafico", "altro"):
         intento = "read"
 
     return {
@@ -406,7 +456,18 @@ Regole:
         "tabella": dati.get("tabella") or None,
         "campi": dati.get("campi", {}) or {},
         "where": dati.get("where", {}) or {},
+        "solo_domanda": bool(dati.get("solo_domanda", False)),
     }
+
+
+def descrivi_campi_tabella(tabella: str, colonne: list) -> str:
+    """Genera una descrizione testuale dei campi di una tabella, per rispondere a 'quali dati servono?'."""
+    righe = []
+    for c in colonne:
+        obbligatorio = "obbligatorio" if not c["nullable"] else "facoltativo"
+        righe.append(f"- **{c['name'].lower()}** ({c['type'].lower()}, {obbligatorio})")
+    return f"Per un'operazione sulla tabella **{tabella}**, questi sono i campi disponibili:\n\n" + "\n".join(righe) + \
+        "\n\nDimmi i valori che vuoi usare e preparo l'operazione con conferma prima di eseguirla."
 
 
 def genera_risposta_generica(domanda: str) -> str:
@@ -479,6 +540,13 @@ st.markdown("""
         background-color: #FFFFFF !important;
     }
     [data-testid="stChatMessage"] * { color: #FFFFFF !important; }
+    /* Eccezione: i campi di input dentro le bolle hanno sfondo chiaro, quindi testo nero */
+    [data-testid="stChatMessage"] input,
+    [data-testid="stChatMessage"] textarea,
+    [data-testid="stChatMessage"] select,
+    [data-testid="stChatMessage"] input::placeholder {
+        color: #000000 !important;
+    }
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         flex-direction: row-reverse !important;
         text-align: right !important;
@@ -812,9 +880,10 @@ with st.form(key="chat_form", clear_on_submit=True):
                     recognition.onerror = function() { if (btn) btn.classList.remove('recording'); };
                     recognition.onresult = function(e) {
                         var transcript = e.results[0][0].transcript;
-                        var input = window.parent.document.querySelector('input[placeholder="Fai una domanda o chiedi una modifica al database..."]');
+                        var input = window.parent.document.querySelector('input[aria-label="Messaggio"]');
                         if (input) {
-                            input.value = transcript;
+                            const setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
+                            setter.call(input, transcript);
                             input.dispatchEvent(new Event('input', { bubbles: true }));
                         }
                     };
