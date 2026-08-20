@@ -111,8 +111,8 @@ DB_PASSWORD = ORACLE_ADMIN_PASSWORD
 WALLET_PASSWORD = ORACLE_WALLET_PASSWORD
 DSN = "text2sqldb_high"
 
-MODEL_SIMPLE = "gemini-3.5-flash"
-MODEL_AGENT = "gemini-3.5-flash"
+MODEL_SIMPLE = "gemini-3.1-flash-lite"
+MODEL_AGENT = "gemini-3.1-flash-lite"
 
 
 _allowed_tables_cache = None
@@ -121,9 +121,10 @@ _columns_cache = {}
 # Cache in memoria per evitare chiamate Gemini duplicate.
 _LLM_CACHE = {}
 _LLM_CACHE_TTL_SECONDS = 300
+_SCHEMA_PROMPT_CACHE = None
 
 # Limite prudenziale per la singola sessione.
-MAX_AI_REQUESTS_PER_SESSION = 40
+MAX_AI_REQUESTS_PER_SESSION = 15
 
 
 def _cache_key(model: str, prompt: str) -> str:
@@ -132,7 +133,14 @@ def _cache_key(model: str, prompt: str) -> str:
 
 
 def _llm_invoke_cached(prompt: str, model=None):
+    """
+    Esegue una sola chiamata LLM quando necessario.
+    Le richieste identiche vengono servite dalla cache per 5 minuti.
+    Gli errori 429 non vengono ritentati in modo aggressivo: il Free Tier
+    ha limiti rigidi e fare retry immediati consumerebbe/peggiorerebbe il problema.
+    """
     import time
+
     model_name = model or MODEL_SIMPLE
     key = _cache_key(model_name, prompt)
     now = time.time()
@@ -141,18 +149,26 @@ def _llm_invoke_cached(prompt: str, model=None):
     if cached and now - cached["time"] < _LLM_CACHE_TTL_SECONDS:
         return cached["content"]
 
-    risposta = _llm(model_name).invoke(prompt)
-    content = _testo(risposta.content)
+    try:
+        risposta = _llm(model_name).invoke(prompt)
+        content = _testo(risposta.content).strip()
+    except Exception as exc:
+        message = str(exc)
+        if "429" in message or "RESOURCE_EXHAUSTED" in message:
+            raise RuntimeError(
+                "Gemini ha raggiunto il limite di richieste disponibile per il "
+                "progetto. Nessun retry automatico è stato effettuato per evitare "
+                "di consumare ulteriormente la quota."
+            ) from exc
+        raise
 
     _LLM_CACHE[key] = {"time": now, "content": content}
 
-    # Evita che la cache cresca indefinitamente.
     if len(_LLM_CACHE) > 500:
         oldest_key = min(_LLM_CACHE, key=lambda k: _LLM_CACHE[k]["time"])
         _LLM_CACHE.pop(oldest_key, None)
 
     return content
-
 
 def _consume_ai_request():
     used = st.session_state.get("ai_requests", 0)
@@ -426,14 +442,37 @@ Rispondi SOLO con la query SQL, senza markdown, senza spiegazioni, senza punto e
     return query
 
 
-def esegui_query_sicura_sola_lettura(query: str):
-    """Esegue una query SOLO se è una singola SELECT, senza parole chiave di scrittura/DDL. Solleva errore altrimenti."""
-    q_lower = query.strip().lower()
+def valida_select_sql(query: str) -> bool:
+    """Permette esclusivamente una singola SELECT di sola lettura."""
+    if not isinstance(query, str):
+        return False
+
+    q = query.strip()
+    q_lower = q.lower()
+
     if not q_lower.startswith("select"):
-        raise ValueError("Solo query di sola lettura (SELECT) sono permesse per i grafici.")
-    for parola in _PAROLE_VIETATE_GRAFICO:
-        if parola in q_lower:
-            raise ValueError(f"Query non permessa: contiene '{parola}'.")
+        return False
+
+    # Una sola istruzione, senza commenti SQL.
+    if ";" in q or "--" in q or "/*" in q or "*/" in q:
+        return False
+
+    parole_bloccate = (
+        " insert ", " update ", " delete ", " drop ", " alter ",
+        " truncate ", " merge ", " grant ", " revoke ", " create ",
+        " commit ", " rollback ", " execute ", " begin ", " declare "
+    )
+    padded = f" {q_lower} "
+
+    return not any(parola in padded for parola in parole_bloccate)
+
+
+def esegui_query_sicura_sola_lettura(query: str):
+    """Esegue esclusivamente una SELECT validata."""
+    query = query.strip().rstrip(";").strip()
+
+    if not valida_select_sql(query):
+        raise ValueError("La query generata non è una SELECT di sola lettura consentita.")
 
     conn = get_connection()
     try:
@@ -446,8 +485,61 @@ def esegui_query_sicura_sola_lettura(query: str):
         conn.close()
 
 
+def formatta_risultato_query(colonne, righe, query) -> str:
+    """Crea una risposta leggibile senza una seconda chiamata all'AI."""
+    if not righe:
+        testo = "Risultato: nessuna riga trovata."
+    else:
+        testo = f"Risultato: {len(righe)} righe trovate."
+
+    # La tabella completa viene mostrata separatamente dalla UI.
+    # Qui salviamo solo una sintesi + SQL.
+    return f"{testo}\n\n**Query SQL generata:**\n\n```sql\n{query}\n```"
+
+
+def mostra_risultato_query(colonne, righe, query, titolo="Risultato"):
+    """Visualizza tabella e, quando richiesto, anche il grafico."""
+    import pandas as pd
+
+    st.markdown(f"### 📋 {titolo}")
+
+    if colonne:
+        df = pd.DataFrame(righe or [], columns=colonne)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if not df.empty:
+            st.markdown("### 📊 Rappresentazione grafica")
+            df_chart = df.copy()
+
+            for col in df_chart.columns:
+                converted = pd.to_numeric(df_chart[col], errors="coerce")
+                if converted.notna().all():
+                    df_chart[col] = converted
+
+            numeric_cols = list(df_chart.select_dtypes(include="number").columns)
+            categorical_cols = [c for c in df_chart.columns if c not in numeric_cols]
+
+            if numeric_cols:
+                if categorical_cols:
+                    index_col = categorical_cols[0]
+                    chart = df_chart[[index_col] + numeric_cols].head(50).copy()
+                    chart[index_col] = chart[index_col].astype(str)
+                    chart = chart.set_index(index_col)
+                    st.bar_chart(chart, use_container_width=True)
+                elif len(numeric_cols) == 1:
+                    st.bar_chart(df_chart[numeric_cols].head(50), use_container_width=True)
+                else:
+                    st.line_chart(df_chart[numeric_cols].head(50), use_container_width=True)
+            else:
+                st.info("Non ci sono valori numerici sufficienti per creare automaticamente un grafico.")
+
+    with st.expander("🔎 Mostra/nascondi SQL generata"):
+        st.code(query, language="sql")
+
+
+
 def _llm(model=None):
-    return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE, temperature=0)
+    return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE)
 
 
 def _testo(content):
@@ -459,49 +551,116 @@ def _testo(content):
     return str(content)
 
 
+def _schema_per_prompt(tabelle_disponibili: list) -> str:
+    """Schema compatto usato dalla singola chiamata Gemini."""
+    global _SCHEMA_PROMPT_CACHE
+
+    if _SCHEMA_PROMPT_CACHE is not None:
+        return _SCHEMA_PROMPT_CACHE
+
+    righe = []
+    for tabella in tabelle_disponibili:
+        try:
+            colonne = get_table_columns(tabella)
+            nomi = []
+            for c in colonne:
+                if isinstance(c, dict):
+                    nomi.append(str(c.get("name", "")))
+                else:
+                    nomi.append(str(c))
+            righe.append(f"{tabella}: {', '.join(nomi)}")
+        except Exception:
+            # Se una tabella non è leggibile, manteniamo almeno il nome.
+            righe.append(f"{tabella}: colonne non disponibili")
+
+    _SCHEMA_PROMPT_CACHE = "\n".join(righe)
+    return _SCHEMA_PROMPT_CACHE
+
+
 def analizza_richiesta(domanda: str, tabelle_disponibili: list) -> dict:
-    elenco = ", ".join(tabelle_disponibili)
-    prompt = f"""Sei un assistente che analizza una richiesta in linguaggio naturale su un database
-Oracle di dati clinici cardiologici.
+    """
+    Un'unica chiamata Gemini per ogni richiesta utile.
 
-Tabelle disponibili: {elenco}
+    Per READ/GRAFICO Gemini restituisce anche direttamente la SELECT.
+    In questo modo eliminiamo il vecchio doppio passaggio:
+        analizza_richiesta -> SQL Agent -> Gemini
+    """
+    schema = _schema_per_prompt(tabelle_disponibili)
 
-Richiesta dell'utente: "{domanda}"
+    prompt = f"""Sei il motore Text2SQL di un'applicazione Streamlit che interroga
+un database Oracle di dati clinici.
 
-Rispondi SOLO con un oggetto JSON valido (nessun testo prima o dopo, nessun blocco markdown),
-in questo formato esatto:
+RICHIESTA UTENTE:
+"{domanda}"
+
+SCHEMA ORACLE DISPONIBILE:
+{schema}
+
+Rispondi SOLO con JSON valido, senza markdown e senza testo esterno.
+
+Formato obbligatorio:
 {{
   "intento": "read" | "insert" | "update" | "delete" | "grafico" | "altro",
   "tabella": "NOME_TABELLA_O_NULL",
-  "campi": {{"NOME_COLONNA": "valore", ...}},
-  "where": {{"NOME_COLONNA": "valore", ...}},
-  "solo_domanda": true | false
+  "campi": {{}},
+  "where": {{}},
+  "solo_domanda": true,
+  "sql": "SELECT ... oppure null"
 }}
 
-Regole:
-- "read": l'utente vuole solo interrogare/leggere dati (ricerche, conteggi, join, statistiche, analisi).
-- "insert": l'utente vuole aggiungere una nuova riga. Usa "campi" per i valori forniti, "where" vuoto.
-- "update": l'utente vuole modificare righe esistenti. Usa "campi" per i nuovi valori, "where" per identificare le righe.
-- "delete": l'utente vuole eliminare righe esistenti. Usa "where" per identificare le righe, "campi" vuoto.
-- "grafico": l'utente vuole vedere un grafico/visualizzazione dei dati (es. "mostrami un grafico di...", "andamento nel tempo di...", "distribuzione di...").
-- "altro": la richiesta NON riguarda questo database (saluti generici, chiacchiere, argomenti non pertinenti).
-- Per "read" e "grafico" imposta comunque "tabella" a null e lascia "campi"/"where" vuoti.
-- "solo_domanda": metti true SOLO se per insert/update/delete l'utente sta chiedendo informazioni
-  (es. "quali dati servono per inserire un paziente?", "cosa mi serve per modificare un esame?"),
-  SENZA fornire alcun dato reale da inserire/modificare/eliminare. Metti false se l'utente sta
-  effettivamente dando un comando con almeno un dato concreto (anche parziale).
-- Non inventare valori non menzionati dall'utente."""
+REGOLE:
+1. read = richiesta di lettura, ricerca, conteggio, statistica, JOIN o analisi.
+2. grafico = l'utente chiede esplicitamente una rappresentazione grafica,
+   un andamento, un diagramma, un istogramma o una visualizzazione.
+3. insert/update/delete = modifica reale dei dati.
+4. altro = saluti o richieste non pertinenti al database.
+5. Per read e grafico, "sql" DEVE contenere una singola SELECT Oracle valida.
+6. Per insert/update/delete/altro, "sql" deve essere null.
+7. Usa SOLO tabelle e colonne presenti nello schema.
+8. Non inventare nomi di colonne.
+9. Una SELECT deve essere di sola lettura.
+10. Non usare INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, MERGE,
+    GRANT, REVOKE, CREATE, COMMIT o ROLLBACK.
+11. Se l'utente chiede un conteggio, restituisci una query aggregata.
+12. Per un grafico, preferisci 2 colonne: categoria/data + valore numerico.
+13. Per risultati dettagliati molto grandi, usa FETCH FIRST 1000 ROWS ONLY.
+14. Non aggiungere punto e virgola alla SQL.
+15. Non inventare valori per INSERT/UPDATE/DELETE.
+16. "solo_domanda" è true solo quando l'utente chiede quali dati servono,
+    senza chiedere di eseguire una modifica.
 
-    testo = _llm_invoke_cached(prompt).strip()
-    testo = re.sub(r"^```(json)?|```$", "", testo, flags=re.MULTILINE).strip()
+Esempio di grafico:
+{{
+  "intento": "grafico",
+  "tabella": null,
+  "campi": {{}},
+  "where": {{}},
+  "solo_domanda": false,
+  "sql": "SELECT ... FROM ... GROUP BY ... ORDER BY ..."
+}}
+"""
+
+    testo = _llm_invoke_cached(prompt, MODEL_SIMPLE).strip()
+    testo = re.sub(r"^```(?:json)?\s*|\s*```$", "", testo, flags=re.IGNORECASE).strip()
+
     try:
         dati = json.loads(testo)
     except json.JSONDecodeError:
-        dati = {}
+        # Tentativo di recupero se il modello ha aggiunto testo attorno al JSON.
+        match = re.search(r"\{.*\}", testo, flags=re.DOTALL)
+        if not match:
+            raise ValueError("Gemini non ha restituito un JSON valido.")
+        dati = json.loads(match.group(0))
 
     intento = str(dati.get("intento", "read")).strip().lower()
     if intento not in ("read", "insert", "update", "delete", "grafico", "altro"):
         intento = "read"
+
+    sql = dati.get("sql")
+    if isinstance(sql, str):
+        sql = sql.replace("```sql", "").replace("```", "").strip().rstrip(";").strip()
+    else:
+        sql = None
 
     return {
         "intento": intento,
@@ -509,8 +668,8 @@ Regole:
         "campi": dati.get("campi", {}) or {},
         "where": dati.get("where", {}) or {},
         "solo_domanda": bool(dati.get("solo_domanda", False)),
+        "sql": sql,
     }
-
 
 def descrivi_campi_tabella(tabella: str, colonne: list) -> str:
     """Genera una descrizione testuale dei campi di una tabella, per rispondere a 'quali dati servono?'."""
@@ -625,7 +784,7 @@ def get_read_agent():
         f"?config_dir={WALLET_DIR}&wallet_location={WALLET_DIR}&wallet_password={encoded_wallet_password}"
     )
     db = SQLDatabase.from_uri(connection_string, sample_rows_in_table_info=2)
-    llm = ChatGoogleGenerativeAI(model=MODEL_AGENT, temperature=0)
+    llm = ChatGoogleGenerativeAI(model=MODEL_AGENT)
     return create_sql_agent(
         llm=llm,
         db=db,
@@ -640,6 +799,31 @@ st.set_page_config(page_title="Text2SQL - Oracle AI Agent", page_icon="🤖", la
 
 st.markdown("""
     <style>
+    /* Riquadri SQL/codice: sfondo bianco e testo nero */
+    [data-testid="stChatMessage"] pre,
+    [data-testid="stChatMessage"] pre code,
+    [data-testid="stChatMessage"] code,
+    [data-testid="stCodeBlock"],
+    [data-testid="stCodeBlock"] pre,
+    [data-testid="stCodeBlock"] code {
+        color: #000000 !important;
+        background-color: #FFFFFF !important;
+    }
+
+    /* Testo nero per tutti i blocchi SQL/codice con sfondo chiaro */
+    [data-testid="stCodeBlock"],
+    [data-testid="stCodeBlock"] pre,
+    [data-testid="stCodeBlock"] code,
+    pre,
+    pre code {
+        color: #000000 !important;
+        background-color: #FFFFFF !important;
+    }
+
+    [data-testid="stDataFrame"] {
+        color: #000000 !important;
+    }
+
     html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] * ,
     [data-testid="stSidebar"], [data-testid="stSidebar"] * {
         color: #000000 !important;
@@ -946,13 +1130,15 @@ if st.session_state.get("pending_chart"):
     chart_request = st.session_state.pending_chart
     try:
         with st.chat_message("assistant"):
-            esegui_e_mostra_grafico(
-                chart_request["domanda"],
-                chart_request["tabelle"]
+            mostra_risultato_query(
+                chart_request["colonne"],
+                chart_request["righe"],
+                chart_request["query"],
+                titolo="Risultato + rappresentazione grafica"
             )
     except Exception as e:
         with st.chat_message("assistant"):
-            st.error(f"⚠️ Non sono riuscito a generare il grafico: {e}")
+            st.error(f"⚠️ Non sono riuscito a visualizzare il grafico: {e}")
     finally:
         st.session_state.pending_chart = None
 
@@ -1052,13 +1238,34 @@ if submit and user_msg.strip():
             tabella = analisi["tabella"]
 
             if intento == "altro":
-                risposta = genera_risposta_generica(user_msg)
+                # Nessuna seconda chiamata Gemini: per una tesi è sufficiente
+                # una risposta locale, così una richiesta non pertinente consuma
+                # al massimo una sola chiamata (quella del router).
+                risposta = (
+                    "Posso aiutarti a interrogare e gestire il database Oracle "
+                    "usando il linguaggio naturale. Prova a chiedermi, ad esempio, "
+                    "di cercare pazienti, contare record, confrontare dati o "
+                    "visualizzare un grafico."
+                )
                 current_messages.append({"role": "assistant", "content": risposta})
 
             elif intento == "grafico":
+                query = analisi.get("sql")
+
+                if not query:
+                    raise ValueError("Non è stata generata una query SQL per il grafico.")
+
+                colonne, righe = esegui_query_sicura_sola_lettura(query)
+
+                current_messages.append({
+                    "role": "assistant",
+                    "content": formatta_risultato_query(colonne, righe, query)
+                })
+
                 st.session_state.pending_chart = {
-                    "domanda": user_msg,
-                    "tabelle": tabelle
+                    "colonne": colonne,
+                    "righe": righe,
+                    "query": query
                 }
 
             elif intento in ("insert", "update", "delete"):
@@ -1092,11 +1299,38 @@ if submit and user_msg.strip():
                         }
 
             else:  # 'read'
-                res = agent.invoke({"input": user_msg})
-                output_text = estrai_testo_risposta(res.get("output", ""))
-                current_messages.append({"role": "assistant", "content": output_text})
+                query = analisi.get("sql")
+
+                if not query:
+                    raise ValueError("Non è stata generata una query SQL per la richiesta.")
+
+                colonne, righe = esegui_query_sicura_sola_lettura(query)
+
+                current_messages.append({
+                    "role": "assistant",
+                    "content": formatta_risultato_query(colonne, righe, query)
+                })
+
+                st.session_state.last_result = {
+                    "colonne": colonne,
+                    "righe": righe,
+                    "query": query,
+                    "grafico": False,
+                }
 
         except Exception as e:
-            current_messages.append({"role": "assistant", "content": f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"})
+            error_text = str(e)
+            if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text or "limite di richieste" in error_text.lower():
+                risposta_errore = (
+                    "⚠️ **Limite Gemini raggiunto.**\n\n"
+                    "La quota API del progetto è temporaneamente esaurita. "
+                    "La richiesta non verrà ritentata automaticamente, così da non consumare "
+                    "ulteriormente la quota. Puoi riprovare quando il limite viene ripristinato "
+                    "oppure aumentare il piano/quota del progetto Google AI."
+                )
+            else:
+                risposta_errore = f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"
+
+            current_messages.append({"role": "assistant", "content": risposta_errore})
 
     st.rerun()
