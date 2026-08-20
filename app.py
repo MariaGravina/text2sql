@@ -113,8 +113,8 @@ DB_PASSWORD = ORACLE_ADMIN_PASSWORD
 WALLET_PASSWORD = ORACLE_WALLET_PASSWORD
 DSN = "text2sqldb_high"
 
-MODEL_SIMPLE = "gemini-2.5-flash-lite"
-MODEL_COMPLEX = "gemini-2.5-flash"
+MODEL_SIMPLE = "gemini-3.5-flash-lite"
+MODEL_COMPLEX = "gemini-3.5-flash"
 
 
 _allowed_tables_cache = None
