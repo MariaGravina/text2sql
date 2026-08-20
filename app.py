@@ -15,8 +15,6 @@ import uuid
 import base64
 import zipfile
 import warnings
-import time
-from collections import deque
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -113,12 +111,66 @@ DB_PASSWORD = ORACLE_ADMIN_PASSWORD
 WALLET_PASSWORD = ORACLE_WALLET_PASSWORD
 DSN = "text2sqldb_high"
 
-MODEL_SIMPLE = "gemini-3.5-flash-lite"
-MODEL_COMPLEX = "gemini-3.5-flash"
+MODEL_SIMPLE = "gemini-3.5-flash"
+MODEL_AGENT = "gemini-3.5-flash"
 
 
 _allowed_tables_cache = None
 _columns_cache = {}
+
+# Cache in memoria per evitare chiamate Gemini duplicate.
+_LLM_CACHE = {}
+_LLM_CACHE_TTL_SECONDS = 300
+
+# Limite prudenziale per la singola sessione.
+MAX_AI_REQUESTS_PER_SESSION = 40
+
+
+def _cache_key(model: str, prompt: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{model}\n{prompt}".encode("utf-8")).hexdigest()
+
+
+def _llm_invoke_cached(prompt: str, model=None):
+    import time
+    model_name = model or MODEL_SIMPLE
+    key = _cache_key(model_name, prompt)
+    now = time.time()
+
+    cached = _LLM_CACHE.get(key)
+    if cached and now - cached["time"] < _LLM_CACHE_TTL_SECONDS:
+        return cached["content"]
+
+    risposta = _llm(model_name).invoke(prompt)
+    content = _testo(risposta.content)
+
+    _LLM_CACHE[key] = {"time": now, "content": content}
+
+    # Evita che la cache cresca indefinitamente.
+    if len(_LLM_CACHE) > 500:
+        oldest_key = min(_LLM_CACHE, key=lambda k: _LLM_CACHE[k]["time"])
+        _LLM_CACHE.pop(oldest_key, None)
+
+    return content
+
+
+def _consume_ai_request():
+    used = st.session_state.get("ai_requests", 0)
+    if used >= MAX_AI_REQUESTS_PER_SESSION:
+        raise RuntimeError(
+            f"Hai raggiunto il limite di {MAX_AI_REQUESTS_PER_SESSION} "
+            "richieste AI in questa sessione."
+        )
+    st.session_state.ai_requests = used + 1
+
+
+def _is_simple_message(text: str) -> bool:
+    normalized = re.sub(r"[^a-zàèéìòù0-9 ]", "", text.lower()).strip()
+    return normalized in {
+        "ciao", "salve", "buongiorno", "buonasera",
+        "buonanotte", "hey", "grazie", "ok",
+        "okay", "perfetto", "va bene"
+    }
 
 
 def get_connection():
@@ -369,8 +421,7 @@ Limita il risultato a un massimo di 50 righe con FETCH FIRST 50 ROWS ONLY.
 
 Rispondi SOLO con la query SQL, senza markdown, senza spiegazioni, senza punto e virgola finale."""
 
-    risposta = _llm().invoke(prompt)
-    query = _testo(risposta.content).strip()
+    query = _llm_invoke_cached(prompt).strip()
     query = re.sub(r"^```(sql)?|```$", "", query, flags=re.MULTILINE).strip().rstrip(";")
     return query
 
@@ -441,8 +492,7 @@ Regole:
   effettivamente dando un comando con almeno un dato concreto (anche parziale).
 - Non inventare valori non menzionati dall'utente."""
 
-    risposta = _llm().invoke(prompt)
-    testo = _testo(risposta.content).strip()
+    testo = _llm_invoke_cached(prompt).strip()
     testo = re.sub(r"^```(json)?|```$", "", testo, flags=re.MULTILINE).strip()
     try:
         dati = json.loads(testo)
@@ -485,126 +535,105 @@ con la tua conoscenza generale, dai una risposta utile e concisa. In ogni caso, 
 (senza essere ripetitivo o formale) che puoi anche aiutare con ricerche, statistiche o modifiche
 sul database clinico, nel caso l'utente fosse interessato."""
 
-    risposta = _llm().invoke(prompt)
-    return _testo(risposta.content).strip()
+    return _llm_invoke_cached(prompt).strip()
 
 
-PREFIX_PROMPT = """Sei un assistente esperto di Oracle SQL per un database clinico cardiologico.
-Rispondi sempre in italiano.
-Il tuo compito è trasformare una richiesta in linguaggio naturale in UNA SOLA query Oracle di sola lettura.
-Sono consentite esclusivamente SELECT, JOIN, aggregazioni, filtri, CASE, sottoquery e CTE.
-NON usare INSERT, UPDATE, DELETE, MERGE, DROP, ALTER, TRUNCATE, GRANT, REVOKE o CREATE.
-Non modificare mai il database.
-Usa esclusivamente le tabelle e le colonne presenti nello schema fornito.
-Non inventare nomi di tabelle o colonne.
-Se la richiesta non è sufficientemente determinata, genera comunque la query più ragionevole possibile.
-La risposta deve essere SOLO JSON valido nel formato:
-{"sql":"SELECT ...","spiegazione":"breve spiegazione in italiano"}.
+PREFIX_PROMPT = """Sei un agente SQL esperto per un database Oracle, specializzato in dati clinici cardiologici.
+Rispondi sempre in italiano, in modo chiaro e comprensibile anche per un utente non tecnico.
+Sei abilitato SOLO a leggere dati (SELECT), anche con JOIN, aggregazioni, filtri e sotto-query complesse.
+Prima di eseguire una query su una tabella, verifica sempre la struttura delle tabelle rilevanti (colonne, tipi).
+Se la domanda è ambigua, fai la scelta più ragionevole e spiega brevemente l'assunzione fatta nella risposta finale.
 """
 
-@st.cache_resource
-def get_read_llm():
-    return ChatGoogleGenerativeAI(model=MODEL_SIMPLE, temperature=0)
+
+
+def mostra_grafico_da_risultati(colonne, righe):
+    """Mostra i risultati in tabella e, se possibile, anche come grafico."""
+    import pandas as pd
+
+    if not righe or not colonne:
+        st.info("Nessun dato disponibile per la rappresentazione grafica.")
+        return
+
+    df = pd.DataFrame(righe, columns=colonne)
+
+    # Riconosce automaticamente le colonne numeriche.
+    for col in df.columns:
+        converted = pd.to_numeric(df[col], errors="coerce")
+        if converted.notna().all():
+            df[col] = converted
+
+    st.markdown("### 📋 Tabella dei risultati")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    numeric_cols = list(df.select_dtypes(include="number").columns)
+    non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
+
+    if not numeric_cols:
+        st.info("I risultati non contengono valori numerici sufficienti per creare automaticamente un grafico.")
+        return
+
+    st.markdown("### 📊 Rappresentazione grafica")
+
+    # Categoria + valore: grafico a barre.
+    if non_numeric_cols:
+        index_col = non_numeric_cols[0]
+        chart_df = df[[index_col] + numeric_cols].head(50).set_index(index_col)
+        st.bar_chart(chart_df, use_container_width=True)
+
+    # Una sola colonna numerica: barre.
+    elif len(numeric_cols) == 1:
+        chart_df = df[numeric_cols].head(50)
+        st.bar_chart(chart_df, use_container_width=True)
+
+    # Più valori numerici: andamento.
+    else:
+        chart_df = df[numeric_cols].head(50)
+        st.line_chart(chart_df, use_container_width=True)
+
+
+def esegui_e_mostra_grafico(domanda: str, tabelle_disponibili: list):
+    """Genera una SELECT sicura, mostra tabella + grafico e la SQL generata."""
+    query = genera_query_grafico(domanda, tabelle_disponibili)
+    colonne, righe = esegui_query_sicura_sola_lettura(query)
+
+    mostra_grafico_da_risultati(colonne, righe)
+
+    with st.expander("🔎 Mostra/nascondi SQL generata"):
+        st.code(query, language="sql")
+
+
+def estrai_testo_risposta(output):
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        parti = [b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"]
+        if parti:
+            return "\n".join(parti)
+    return str(output)
+
 
 @st.cache_resource
-def get_complex_llm():
-    return ChatGoogleGenerativeAI(model=MODEL_COMPLEX, temperature=0)
+def get_read_agent():
+    from urllib.parse import quote_plus
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_schema_compact():
-    tables = get_allowed_tables()
-    schema = []
-    for table in tables:
-        cols = get_table_columns(table)
-        schema.append({
-            "table": table,
-            "columns": [
-                {"name": c["name"], "type": c["type"], "nullable": c["nullable"]}
-                for c in cols
-            ]
-        })
-    return schema
-
-def _schema_text():
-    return json.dumps(get_schema_compact(), ensure_ascii=False, separators=(",", ":"))
-
-def _is_simple_message(message: str) -> bool:
-    msg = re.sub(r"[!?.,;:]+", "", message.lower().strip())
-    simple = {
-        "ciao", "salve", "buongiorno", "buonasera", "buonanotte",
-        "hey", "ok", "okay", "grazie", "grazie mille"
-    }
-    return msg in simple
-
-def risposta_semplice(message: str):
-    msg = message.lower().strip()
-    if msg in {"grazie", "grazie mille"}:
-        return "Di nulla! Se vuoi, posso aiutarti a interrogare il database."
-    return "Ciao! Posso aiutarti a interrogare e analizzare il database clinico. Cosa vuoi sapere?"
-
-def genera_sql_lettura(domanda: str):
-    schema = _schema_text()
-    prompt = f"""{PREFIX_PROMPT}
-
-SCHEMA DEL DATABASE:
-{schema}
-
-RICHIESTA DELL'UTENTE:
-{domanda}
-"""
-    risposta = get_read_llm().invoke(prompt)
-    raw = _testo(risposta.content).strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Fallback: estrai la prima SELECT dal testo.
-        match = re.search(r"(?is)\bSELECT\b.*", raw)
-        if not match:
-            raise ValueError("Il modello non ha restituito una query SQL valida.")
-        sql = match.group(0).strip().rstrip(";")
-        return sql, ""
-
-    sql = str(data.get("sql", "")).strip().rstrip(";")
-    spiegazione = str(data.get("spiegazione", "")).strip()
-
-    if not sql:
-        raise ValueError("Il modello non ha restituito una query SQL.")
-
-    return sql, spiegazione
-
-def valida_select(sql: str):
-    q = sql.strip().lower()
-    if not q.startswith("select") and not q.startswith("with"):
-        raise ValueError("Sono consentite solo query SELECT.")
-
-    # Evita comandi multipli e operazioni di modifica.
-    if ";" in q:
-        raise ValueError("Sono consentite query singole.")
-    for parola in _PAROLE_VIETATE_GRAFICO:
-        if parola in q:
-            raise ValueError(f"Query non permessa: contiene '{parola}'.")
-
-    # Evita accesso a oggetti non appartenenti allo schema.
-    # La validazione strutturale principale resta affidata allo schema fornito al modello.
-    return sql
-
-@st.cache_data(ttl=30, show_spinner=False)
-def esegui_select_cache(sql: str):
-    sql = valida_select(sql)
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(sql)
-        colonne = [d[0] for d in cur.description]
-        righe = cur.fetchall()
-        return colonne, righe
-    finally:
-        conn.close()
-
-def esegui_select(sql: str):
-    return esegui_select_cache(sql)
+    encoded_user = quote_plus(DB_USER)
+    encoded_password = quote_plus(DB_PASSWORD)
+    encoded_wallet_password = quote_plus(WALLET_PASSWORD)
+    connection_string = (
+        f"oracle+oracledb://{encoded_user}:{encoded_password}@{DSN}"
+        f"?config_dir={WALLET_DIR}&wallet_location={WALLET_DIR}&wallet_password={encoded_wallet_password}"
+    )
+    db = SQLDatabase.from_uri(connection_string, sample_rows_in_table_info=2)
+    llm = ChatGoogleGenerativeAI(model=MODEL_AGENT, temperature=0)
+    return create_sql_agent(
+        llm=llm,
+        db=db,
+        verbose=True,
+        prefix=PREFIX_PROMPT,
+        agent_type="tool-calling",
+        handle_parsing_errors=True,
+    )
 
 
 st.set_page_config(page_title="Text2SQL - Oracle AI Agent", page_icon="🤖", layout="wide")
@@ -654,10 +683,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 try:
-    # Verifica solo che le credenziali siano disponibili.
-    get_allowed_tables()
+    agent = get_read_agent()
 except Exception as e:
-    st.error(f"Errore di connessione al Database: {e}")
+    st.error(f"Errore di connessione al Database o API Gemini: {e}")
     st.stop()
 
 if "all_chats" not in st.session_state:
@@ -673,37 +701,21 @@ if "current_chat_id" not in st.session_state:
 if "pending_write" not in st.session_state:
     st.session_state.pending_write = None
 
-# Limite leggero per la demo di tesi.
-# Evita che una singola sessione consumi rapidamente tutta la quota Gemini.
-REQUEST_LIMIT = 30
-REQUEST_WINDOW_SECONDS = 3600
+if "ai_requests" not in st.session_state:
+    st.session_state.ai_requests = 0
 
-if "request_times" not in st.session_state:
-    st.session_state.request_times = deque()
-
-def richiesta_consentita():
-    now = time.time()
-    while st.session_state.request_times and now - st.session_state.request_times[0] > REQUEST_WINDOW_SECONDS:
-        st.session_state.request_times.popleft()
-
-    if len(st.session_state.request_times) >= REQUEST_LIMIT:
-        return False
-
-    st.session_state.request_times.append(now)
-    return True
-
-def richieste_rimanenti():
-    now = time.time()
-    while st.session_state.request_times and now - st.session_state.request_times[0] > REQUEST_WINDOW_SECONDS:
-        st.session_state.request_times.popleft()
-    return max(0, REQUEST_LIMIT - len(st.session_state.request_times))
+if "pending_chart" not in st.session_state:
+    st.session_state.pending_chart = None
 
 
-def nuova_chat(messaggio_iniziale):
+def nuova_chat(messaggio_iniziale, reset_ai_counter=False):
     new_id = str(uuid.uuid4())
     st.session_state.current_chat_id = new_id
     st.session_state.all_chats[new_id] = [{"role": "assistant", "content": messaggio_iniziale}]
     st.session_state.pending_write = None
+    st.session_state.pending_chart = None
+    if reset_ai_counter:
+        st.session_state.ai_requests = 0
 
 
 with st.sidebar:
@@ -715,6 +727,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Storico Chat")
+    st.caption(f"Richieste AI sessione: {st.session_state.get('ai_requests', 0)}/{MAX_AI_REQUESTS_PER_SESSION}")
 
     for cid in reversed(list(st.session_state.all_chats.keys())):
         messages = st.session_state.all_chats[cid]
@@ -744,11 +757,10 @@ with st.sidebar:
 col_head1, col_head2 = st.columns([0.75, 0.25])
 with col_head1:
     st.title("🤖 Text2SQL Assistant")
-    st.caption(f"Richieste AI disponibili in questa sessione: **{richieste_rimanenti()}/{REQUEST_LIMIT}**")
 with col_head2:
     st.write("")
     if st.button("🛑 Termina Sessione", use_container_width=True):
-        nuova_chat("Sessione precedente terminata. Nuova conversazione avviata!")
+        nuova_chat("Sessione precedente terminata. Nuova conversazione avviata!", reset_ai_counter=True)
         st.rerun()
 
 
@@ -776,14 +788,6 @@ for idx, msg in enumerate(current_messages):
                 """,
                 height=35,
             )
-
-if st.session_state.get("last_query_result"):
-    result = st.session_state["last_query_result"]
-    st.markdown("### 📊 Risultato della query")
-    st.dataframe(
-        [dict(zip(result["columns"], row)) for row in result["rows"]],
-        use_container_width=True
-    )
 
 if st.session_state.pending_write:
     pw = st.session_state.pending_write
@@ -818,9 +822,6 @@ if st.session_state.pending_write:
                 try:
                     sql = execute_insert(pw["table"], valori_finali)
                     msg = f"Riga inserita correttamente nella tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
-                    esegui_select_cache.clear()
-                    esegui_select_cache.clear()
-                    esegui_select_cache.clear()
                     current_messages.append({"role": "assistant", "content": msg})
                 except Exception as e:
                     current_messages.append({"role": "assistant", "content": f"⚠️ Errore durante l'inserimento: {e}"})
@@ -941,6 +942,20 @@ if st.session_state.pending_write:
 
 pending_active = bool(st.session_state.pending_write)
 
+if st.session_state.get("pending_chart"):
+    chart_request = st.session_state.pending_chart
+    try:
+        with st.chat_message("assistant"):
+            esegui_e_mostra_grafico(
+                chart_request["domanda"],
+                chart_request["tabelle"]
+            )
+    except Exception as e:
+        with st.chat_message("assistant"):
+            st.error(f"⚠️ Non sono riuscito a generare il grafico: {e}")
+    finally:
+        st.session_state.pending_chart = None
+
 with st.form(key="chat_form", clear_on_submit=True):
     c_input, c_mic, c_send = st.columns([10, 1, 1])
 
@@ -1020,58 +1035,68 @@ with st.form(key="chat_form", clear_on_submit=True):
 if submit and user_msg.strip():
     current_messages.append({"role": "user", "content": user_msg})
 
-    # I saluti non consumano richieste AI.
-    if _is_simple_message(user_msg):
-        current_messages.append({"role": "assistant", "content": risposta_semplice(user_msg)})
-        st.rerun()
-
-    # Per una demo di tesi limitiamo il consumo della quota per sessione.
-    if not richiesta_consentita():
-        current_messages.append({
-            "role": "assistant",
-            "content": f"⚠️ Hai raggiunto il limite di {REQUEST_LIMIT} richieste AI nell'ultima ora per questa sessione. "
-                       "Il limite serve a proteggere la quota dell'app durante la demo."
-        })
-        st.rerun()
-
     with st.spinner("Elaborazione della richiesta in corso..."):
         try:
-            # Una sola chiamata AI per le richieste di lettura.
-            sql, spiegazione = genera_sql_lettura(user_msg)
-            sql = valida_select(sql)
+            if _is_simple_message(user_msg):
+                if user_msg.lower().strip() in {"grazie", "ok", "okay", "perfetto", "va bene"}:
+                    risposta = "Di nulla! Sono qui per aiutarti con il database."
+                else:
+                    risposta = "Ciao! Come posso aiutarti con il database Oracle?"
+                current_messages.append({"role": "assistant", "content": risposta})
+                st.rerun()
 
-            colonne, righe = esegui_select(sql)
+            _consume_ai_request()
+            tabelle = get_allowed_tables()
+            analisi = analizza_richiesta(user_msg, tabelle)
+            intento = analisi["intento"]
+            tabella = analisi["tabella"]
 
-            if spiegazione:
-                output_text = spiegazione + "\n\n"
-            else:
-                output_text = ""
+            if intento == "altro":
+                risposta = genera_risposta_generica(user_msg)
+                current_messages.append({"role": "assistant", "content": risposta})
 
-            output_text += f"**Risultato:** {len(righe)} righe trovate.\n\n"
-
-            if righe:
-                st.session_state[f"result_{len(current_messages)}"] = (
-                    colonne, righe
-                )
-                # Il dataframe viene mostrato tramite un messaggio sintetico;
-                # il risultato viene visualizzato subito sotto.
-                output_text += f"```sql\n{sql}\n```"
-            else:
-                output_text += f"```sql\n{sql}\n```"
-
-            current_messages.append({"role": "assistant", "content": output_text})
-
-            # Mostra il risultato in modo immediato.
-            if righe:
-                st.session_state["last_query_result"] = {
-                    "columns": colonne,
-                    "rows": righe
+            elif intento == "grafico":
+                st.session_state.pending_chart = {
+                    "domanda": user_msg,
+                    "tabelle": tabelle
                 }
 
+            elif intento in ("insert", "update", "delete"):
+                if not tabella or tabella.upper() not in [t.upper() for t in tabelle]:
+                    current_messages.append({
+                        "role": "assistant",
+                        "content": f"Non ho identificato una tabella valida per questa operazione. Tabelle disponibili: {', '.join(tabelle)}"
+                    })
+                else:
+                    tabella_real = [t for t in tabelle if t.upper() == tabella.upper()][0]
+                    if intento == "insert":
+                        cols = get_table_columns(tabella_real)
+                        st.session_state.pending_write = {
+                            "operation": "insert",
+                            "table": tabella_real,
+                            "columns": cols,
+                            "provided": analisi["campi"],
+                        }
+                    elif intento == "update":
+                        st.session_state.pending_write = {
+                            "operation": "update",
+                            "table": tabella_real,
+                            "set": analisi["campi"],
+                            "where": analisi["where"],
+                        }
+                    elif intento == "delete":
+                        st.session_state.pending_write = {
+                            "operation": "delete",
+                            "table": tabella_real,
+                            "where": analisi["where"],
+                        }
+
+            else:  # 'read'
+                res = agent.invoke({"input": user_msg})
+                output_text = estrai_testo_risposta(res.get("output", ""))
+                current_messages.append({"role": "assistant", "content": output_text})
+
         except Exception as e:
-            current_messages.append({
-                "role": "assistant",
-                "content": f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"
-            })
+            current_messages.append({"role": "assistant", "content": f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"})
 
     st.rerun()
