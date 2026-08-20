@@ -17,16 +17,13 @@ import zipfile
 import warnings
 from dotenv import load_dotenv
 
-# Load env variables early
 load_dotenv()
 
-# Forza oracledb ad usare SOLO la modalità Thin in Python puro
 os.environ["PYORACLEDB_THIN_MODE"] = "1"
 
 import streamlit as st
 import oracledb
 
-# Mantiene la modalità Thin nativa
 oracledb.init_oracle_client = None
 
 from langchain_community.utilities import SQLDatabase
@@ -35,12 +32,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 warnings.filterwarnings("ignore")
 
-# =========================================================
-# GESTIONE WALLET PER STREAMLIT CLOUD
-# =========================================================
 WALLET_DIR_NAME = "Wallet_text2sqldb"
 
-# Se la cartella del wallet non esiste (es. su Streamlit Cloud), la ricrea da Base64
 if not os.path.exists(WALLET_DIR_NAME):
     wallet_b64 = st.secrets.get("ORACLE_WALLET_BASE64") or os.environ.get("ORACLE_WALLET_BASE64")
     if wallet_b64:
@@ -56,10 +49,6 @@ WALLET_DIR = os.path.abspath(WALLET_DIR_NAME)
 
 
 def apri_porta_firewall(porta: int = 8501):
-    """
-    Tenta di creare automaticamente una regola nel Firewall di Windows per
-    permettere le connessioni in ingresso da altri PC della rete locale.
-    """
     import platform
     import subprocess
 
@@ -82,28 +71,22 @@ def apri_porta_firewall(porta: int = 8501):
                 ],
                 capture_output=True, text=True, timeout=5, check=True,
             )
-            print(f"✅ Regola firewall creata automaticamente per la porta {porta}.")
+            print(f"Regola firewall creata automaticamente per la porta {porta}.")
         else:
-            print(f"✅ Regola firewall per la porta {porta} già presente.")
+            print(f"Regola firewall per la porta {porta} già presente.")
     except Exception:
-        print(
-            f"⚠️  Non sono riuscito ad aprire automaticamente la porta {porta} nel firewall.\n"
-        )
+        print(f"Non sono riuscito ad aprire automaticamente la porta {porta} nel firewall.\n")
 
 
 apri_porta_firewall()
 
 
-# Helper per recuperare chiavi da Secrets o da .env
 def get_secret(key: str) -> str:
     if key in st.secrets:
         return st.secrets[key]
     return os.environ.get(key, "")
 
 
-# =========================================================
-# CONFIGURAZIONE
-# =========================================================
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
 ORACLE_ADMIN_PASSWORD = get_secret("ORACLE_ADMIN_PASSWORD")
 ORACLE_WALLET_PASSWORD = get_secret("ORACLE_WALLET_PASSWORD")
@@ -120,7 +103,7 @@ if not ORACLE_WALLET_PASSWORD:
     _mancanti.append("ORACLE_WALLET_PASSWORD")
 
 if _mancanti:
-    st.error(f"❌ Variabili mancanti nel file .env o nei Secrets: {', '.join(_mancanti)}")
+    st.error(f"Variabili mancanti nel file .env o nei Secrets: {', '.join(_mancanti)}")
     st.stop()
 
 DB_USER = "ADMIN"
@@ -128,14 +111,10 @@ DB_PASSWORD = ORACLE_ADMIN_PASSWORD
 WALLET_PASSWORD = ORACLE_WALLET_PASSWORD
 DSN = "text2sqldb_high"
 
-# Modelli Gemini con piano Free esteso
 MODEL_SIMPLE = "gemini-2.5-flash-lite"
 MODEL_AGENT = "gemini-2.0-flash"
 
 
-# =========================================================
-# ACCESSO A ORACLE (letture di schema + scritture sicure)
-# =========================================================
 _allowed_tables_cache = None
 _columns_cache = {}
 
@@ -152,7 +131,6 @@ def get_connection():
 
 
 def get_allowed_tables(force_refresh: bool = False):
-    """Elenco delle tabelle realmente presenti nello schema (whitelist)."""
     global _allowed_tables_cache
     if _allowed_tables_cache is not None and not force_refresh:
         return _allowed_tables_cache
@@ -167,7 +145,6 @@ def get_allowed_tables(force_refresh: bool = False):
 
 
 def get_table_columns(table_name: str):
-    """Colonne reali di una tabella (nome, nullable, tipo), validando il nome tabella."""
     table_name = table_name.upper().strip()
     if table_name not in [t.upper() for t in get_allowed_tables()]:
         raise ValueError(f"Tabella non riconosciuta nel database: {table_name}")
@@ -194,7 +171,6 @@ def get_table_columns(table_name: str):
 
 
 def execute_insert(table_name: str, fields: dict):
-    """Esegue un INSERT parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -226,7 +202,6 @@ def execute_insert(table_name: str, fields: dict):
 
 
 def execute_update(table_name: str, set_fields: dict, where_fields: dict):
-    """Esegue un UPDATE parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -272,8 +247,44 @@ def execute_update(table_name: str, set_fields: dict, where_fields: dict):
         conn.close()
 
 
+def fetch_matching_rows(table_name: str, where_fields: dict, limit: int = 10):
+    """Recupera le righe reali che corrispondono alla condizione, per mostrarle come anteprima prima di modificare/eliminare."""
+    table_name = table_name.upper().strip()
+    columns_info = get_table_columns(table_name)
+    valid_columns = {c["name"] for c in columns_info}
+
+    clean_where = {}
+    for raw_name, raw_value in where_fields.items():
+        name = raw_name.upper().strip()
+        if name not in valid_columns:
+            raise ValueError(f"Colonna non valida per la tabella {table_name}: {raw_name}")
+        clean_where[name] = None if raw_value in (None, "", "NULL", "null") else raw_value
+
+    if not clean_where:
+        raise ValueError("Nessuna condizione specificata.")
+
+    where_cols = list(clean_where.keys())
+    where_clause = " AND ".join(
+        f"{c} IS NULL" if clean_where[c] is None else f"{c} = :{i + 1}"
+        for i, c in enumerate(where_cols)
+    )
+    values = [clean_where[c] for c in where_cols if clean_where[c] is not None]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT * FROM {table_name} WHERE {where_clause} FETCH FIRST {int(limit)} ROWS ONLY",
+            values,
+        )
+        colonne = [d[0] for d in cur.description]
+        righe = cur.fetchall()
+        return colonne, righe
+    finally:
+        conn.close()
+
+
 def count_matching(table_name: str, where_fields: dict) -> int:
-    """Conta quante righe soddisfano una condizione."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -305,7 +316,6 @@ def count_matching(table_name: str, where_fields: dict) -> int:
 
 
 def execute_delete(table_name: str, where_fields: dict):
-    """Esegue un DELETE parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -339,9 +349,6 @@ def execute_delete(table_name: str, where_fields: dict):
         conn.close()
 
 
-# =========================================================
-# GEMINI: classificazione intento + estrazione campi
-# =========================================================
 def _llm(model=None):
     return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE, temperature=0)
 
@@ -402,9 +409,23 @@ Regole:
     }
 
 
-# =========================================================
-# AGENTE DI SOLA LETTURA (SELECT)
-# =========================================================
+def genera_risposta_generica(domanda: str) -> str:
+    """Genera una risposta breve e cordiale per richieste non pertinenti al database, invece di un errore o un messaggio fisso."""
+    prompt = f"""Sei l'assistente di un'applicazione per interrogare e gestire un database Oracle
+di dati clinici cardiologici (pazienti, esami, visite, coronarografie, ecc.).
+
+L'utente ha scritto questo messaggio, che non sembra riguardare direttamente il database: "{domanda}"
+
+Rispondi in modo breve, naturale e cordiale in italiano (massimo 2-3 frasi). Se il messaggio è un
+saluto o small talk, rispondi in modo amichevole. Se è una domanda generica a cui puoi rispondere
+con la tua conoscenza generale, dai una risposta utile e concisa. In ogni caso, ricorda con naturalezza
+(senza essere ripetitivo o formale) che puoi anche aiutare con ricerche, statistiche o modifiche
+sul database clinico, nel caso l'utente fosse interessato."""
+
+    risposta = _llm().invoke(prompt)
+    return _testo(risposta.content).strip()
+
+
 PREFIX_PROMPT = """Sei un agente SQL esperto per un database Oracle, specializzato in dati clinici cardiologici.
 Rispondi sempre in italiano, in modo chiaro e comprensibile anche per un utente non tecnico.
 Sei abilitato SOLO a leggere dati (SELECT), anche con JOIN, aggregazioni, filtri e sotto-query complesse.
@@ -446,9 +467,6 @@ def get_read_agent():
     )
 
 
-# =========================================================
-# INTERFACCIA STREAMLIT
-# =========================================================
 st.set_page_config(page_title="Text2SQL - Oracle AI Agent", page_icon="🤖", layout="wide")
 
 st.markdown("""
@@ -515,7 +533,6 @@ def nuova_chat(messaggio_iniziale):
     st.session_state.pending_write = None
 
 
-# --- SIDEBAR ---
 with st.sidebar:
     st.title("📜 Conversazioni")
 
@@ -551,7 +568,6 @@ with st.sidebar:
                 st.session_state.pending_write = None
             st.rerun()
 
-# --- HEADER ---
 col_head1, col_head2 = st.columns([0.75, 0.25])
 with col_head1:
     st.title("🤖 Text2SQL Assistant")
@@ -562,7 +578,6 @@ with col_head2:
         st.rerun()
 
 
-# --- STORICO MESSAGGI ---
 current_messages = st.session_state.all_chats[st.session_state.current_chat_id]
 for idx, msg in enumerate(current_messages):
     with st.chat_message(msg["role"]):
@@ -588,7 +603,6 @@ for idx, msg in enumerate(current_messages):
                 height=35,
             )
 
-# --- CARD DI CONFERMA PER SCRITTURE IN SOSPESO ---
 if st.session_state.pending_write:
     pw = st.session_state.pending_write
     operazione = pw["operation"]
@@ -635,15 +649,21 @@ if st.session_state.pending_write:
         elif operazione == "update":
             st.warning(f"⚠️ Stai per modificare righe nella tabella **{pw['table']}**. Controlla campi e condizione prima di confermare.")
 
-            st.markdown("**Campi da modificare:**")
+            st.markdown("**Campi da modificare** (lascia vuoto e spunta NULL per azzerare un campo):")
             set_finale = {}
             for name, value in pw["set"].items():
-                val = st.text_input(
-                    name.lower().replace("_", " "),
-                    value=str(value) if value is not None else "",
-                    key=f"set_{name}_{st.session_state.current_chat_id}",
-                )
-                set_finale[name] = val
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    is_null_default = value in (None, "", "NULL", "null")
+                    val = st.text_input(
+                        name.lower().replace("_", " "),
+                        value="" if is_null_default else str(value),
+                        key=f"set_{name}_{st.session_state.current_chat_id}",
+                        disabled=st.session_state.get(f"setnull_{name}_{st.session_state.current_chat_id}", is_null_default),
+                    )
+                with col2:
+                    is_null = st.checkbox("NULL", value=is_null_default, key=f"setnull_{name}_{st.session_state.current_chat_id}")
+                set_finale[name] = None if is_null else val
 
             st.markdown("**Condizione (quali righe modificare):**")
             where_finale = {}
@@ -659,9 +679,22 @@ if st.session_state.pending_write:
                 st.info("Non ho riconosciuto campi da modificare. Riscrivi la richiesta specificando cosa cambiare.")
             if not pw["where"]:
                 st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe.")
+            elif all(where_finale.values()):
+                try:
+                    colonne_prev, righe_prev = fetch_matching_rows(pw["table"], where_finale)
+                    if righe_prev:
+                        st.markdown("**Riga/e attualmente nel database (prima della modifica):**")
+                        st.dataframe(
+                            [dict(zip(colonne_prev, r)) for r in righe_prev],
+                            use_container_width=True,
+                        )
+                    else:
+                        st.warning("Nessuna riga corrisponde a questa condizione: verifica i valori inseriti.")
+                except Exception as e:
+                    st.error(f"Impossibile mostrare l'anteprima: {e}")
 
             c1, c2 = st.columns(2)
-            if c1.button("✅ Conferma ed esegui la modifica", use_container_width=True, disabled=not (set_finale and where_finale)):
+            if c1.button("✅ Conferma ed esegui la modifica", use_container_width=True, disabled=not (set_finale and where_finale and all(where_finale.values()))):
                 try:
                     sql, righe = execute_update(pw["table"], set_finale, where_finale)
                     msg = f"{righe} riga/e modificata/e nella tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
@@ -694,6 +727,13 @@ if st.session_state.pending_write:
                 try:
                     conteggio = count_matching(pw["table"], where_finale)
                     st.warning(f"Questa condizione corrisponde a **{conteggio} riga/e**. Verranno eliminate tutte.")
+                    if conteggio:
+                        colonne_prev, righe_prev = fetch_matching_rows(pw["table"], where_finale)
+                        st.markdown("**Riga/e che verranno eliminate:**")
+                        st.dataframe(
+                            [dict(zip(colonne_prev, r)) for r in righe_prev],
+                            use_container_width=True,
+                        )
                 except Exception as e:
                     st.error(f"Impossibile verificare l'anteprima: {e}")
 
@@ -714,7 +754,6 @@ if st.session_state.pending_write:
                 st.session_state.pending_write = None
                 st.rerun()
 
-# --- INPUT UTENTE ---
 pending_active = bool(st.session_state.pending_write)
 
 with st.form(key="chat_form", clear_on_submit=True):
@@ -803,7 +842,7 @@ if submit and user_msg.strip():
             tabella = analisi["tabella"]
 
             if intento == "altro":
-                risposta = "Non riesco ad elaborare questa richiesta. Posso aiutarti solo con consultazioni e modifiche al database Oracle."
+                risposta = genera_risposta_generica(user_msg)
                 current_messages.append({"role": "assistant", "content": risposta})
 
             elif intento in ("insert", "update", "delete"):
