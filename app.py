@@ -1,51 +1,59 @@
 """
 Text2SQL Assistant — Streamlit, file unico.
 
-Richiede nella stessa cartella:
-  - un file .env con GOOGLE_API_KEY, ORACLE_ADMIN_PASSWORD, ORACLE_WALLET_PASSWORD
-  - la cartella Wallet_text2sqldb (wallet Oracle)
+Richiede:
+  - In locale: file .env con GOOGLE_API_KEY, ORACLE_ADMIN_PASSWORD, ORACLE_WALLET_PASSWORD
+  - Su Streamlit Cloud: Secrets configurati con le stesse chiavi + ORACLE_WALLET_BASE64
 
-Avvio: streamlit run app.py
+Avvio locale: streamlit run app.py
 """
 
 import os
 import re
 import json
 import uuid
+import base64
+import zipfile
 import warnings
+from dotenv import load_dotenv
 
-# Forza oracledb ad usare SOLO la modalità Thin in Python puro (evita errori di blocco DLL su Windows)
+load_dotenv()
+
 os.environ["PYORACLEDB_THIN_MODE"] = "1"
 
 import streamlit as st
 import oracledb
 
-# Mantiene la modalità Thin nativa
 oracledb.init_oracle_client = None
-
-from dotenv import load_dotenv
-
-load_dotenv()
-os.environ["PYORACLEDB_THIN_MODE"] = "1"
 
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 warnings.filterwarnings("ignore")
-load_dotenv()
+
+WALLET_DIR_NAME = "Wallet_text2sqldb"
+
+if not os.path.exists(WALLET_DIR_NAME):
+    wallet_b64 = st.secrets.get("ORACLE_WALLET_BASE64") or os.environ.get("ORACLE_WALLET_BASE64")
+    if wallet_b64:
+        os.makedirs(WALLET_DIR_NAME, exist_ok=True)
+        zip_path = "temp_wallet.zip"
+        with open(zip_path, "wb") as f:
+            f.write(base64.b64decode(wallet_b64))
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(WALLET_DIR_NAME)
+        os.remove(zip_path)
+
+WALLET_DIR = os.path.abspath(WALLET_DIR_NAME)
 
 
 def apri_porta_firewall(porta: int = 8501):
-    """
-    Tenta di creare automaticamente una regola nel Firewall di Windows per
-    permettere le connessioni in ingresso da altri PC della rete locale.
-    """
     import platform
     import subprocess
 
     if platform.system() != "Windows":
-        return  # rilevante solo su Windows
+        return
 
     nome_regola = "Streamlit App"
     try:
@@ -63,42 +71,122 @@ def apri_porta_firewall(porta: int = 8501):
                 ],
                 capture_output=True, text=True, timeout=5, check=True,
             )
-            print(f"✅ Regola firewall creata automaticamente per la porta {porta}.")
+            print(f"Regola firewall creata automaticamente per la porta {porta}.")
         else:
-            print(f"✅ Regola firewall per la porta {porta} già presente.")
+            print(f"Regola firewall per la porta {porta} già presente.")
     except Exception:
-        print(
-            f"⚠️  Non sono riuscito ad aprire automaticamente la porta {porta} nel firewall.\n"
-        )
+        print(f"Non sono riuscito ad aprire automaticamente la porta {porta} nel firewall.\n")
 
 
 apri_porta_firewall()
 
-# =========================================================
-# CONFIGURAZIONE
-# =========================================================
-REQUIRED_ENV_VARS = ["GOOGLE_API_KEY", "ORACLE_ADMIN_PASSWORD", "ORACLE_WALLET_PASSWORD"]
-_mancanti = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+
+def get_secret(key: str) -> str:
+    if key in st.secrets:
+        return st.secrets[key]
+    return os.environ.get(key, "")
+
+
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
+ORACLE_ADMIN_PASSWORD = get_secret("ORACLE_ADMIN_PASSWORD")
+ORACLE_WALLET_PASSWORD = get_secret("ORACLE_WALLET_PASSWORD")
+
+if GOOGLE_API_KEY:
+    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+
+_mancanti = []
+if not GOOGLE_API_KEY:
+    _mancanti.append("GOOGLE_API_KEY")
+if not ORACLE_ADMIN_PASSWORD:
+    _mancanti.append("ORACLE_ADMIN_PASSWORD")
+if not ORACLE_WALLET_PASSWORD:
+    _mancanti.append("ORACLE_WALLET_PASSWORD")
+
 if _mancanti:
-    st.error(f"❌ Variabili mancanti nel file .env o nei Secrets: {', '.join(_mancanti)}")
+    st.error(f"Variabili mancanti nel file .env o nei Secrets: {', '.join(_mancanti)}")
     st.stop()
 
 DB_USER = "ADMIN"
-DB_PASSWORD = os.environ["ORACLE_ADMIN_PASSWORD"]
-WALLET_PASSWORD = os.environ["ORACLE_WALLET_PASSWORD"]
+DB_PASSWORD = ORACLE_ADMIN_PASSWORD
+WALLET_PASSWORD = ORACLE_WALLET_PASSWORD
 DSN = "text2sqldb_high"
-WALLET_DIR = os.path.abspath("Wallet_text2sqldb")
 
-# Modelli Gemini con piano Free esteso
-MODEL_SIMPLE = "gemini-2.5-flash-lite"
-MODEL_AGENT = "gemini-2.0-flash"
+MODEL_SIMPLE = "gemini-3.1-flash-lite"
+MODEL_AGENT = "gemini-3.1-flash-lite"
 
 
-# =========================================================
-# ACCESSO A ORACLE (letture di schema + scritture sicure)
-# =========================================================
 _allowed_tables_cache = None
 _columns_cache = {}
+
+# Cache in memoria per evitare chiamate Gemini duplicate.
+_LLM_CACHE = {}
+_LLM_CACHE_TTL_SECONDS = 300
+_SCHEMA_PROMPT_CACHE = None
+
+# Limite prudenziale per la singola sessione.
+MAX_AI_REQUESTS_PER_SESSION = 15
+
+
+def _cache_key(model: str, prompt: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{model}\n{prompt}".encode("utf-8")).hexdigest()
+
+
+def _llm_invoke_cached(prompt: str, model=None):
+    """
+    Esegue una sola chiamata LLM quando necessario.
+    Le richieste identiche vengono servite dalla cache per 5 minuti.
+    Gli errori 429 non vengono ritentati in modo aggressivo: il Free Tier
+    ha limiti rigidi e fare retry immediati consumerebbe/peggiorerebbe il problema.
+    """
+    import time
+
+    model_name = model or MODEL_SIMPLE
+    key = _cache_key(model_name, prompt)
+    now = time.time()
+
+    cached = _LLM_CACHE.get(key)
+    if cached and now - cached["time"] < _LLM_CACHE_TTL_SECONDS:
+        return cached["content"]
+
+    try:
+        risposta = _llm(model_name).invoke(prompt)
+        content = _testo(risposta.content).strip()
+    except Exception as exc:
+        message = str(exc)
+        if "429" in message or "RESOURCE_EXHAUSTED" in message:
+            raise RuntimeError(
+                "Gemini ha raggiunto il limite di richieste disponibile per il "
+                "progetto. Nessun retry automatico è stato effettuato per evitare "
+                "di consumare ulteriormente la quota."
+            ) from exc
+        raise
+
+    _LLM_CACHE[key] = {"time": now, "content": content}
+
+    if len(_LLM_CACHE) > 500:
+        oldest_key = min(_LLM_CACHE, key=lambda k: _LLM_CACHE[k]["time"])
+        _LLM_CACHE.pop(oldest_key, None)
+
+    return content
+
+def _consume_ai_request():
+    used = st.session_state.get("ai_requests", 0)
+    if used >= MAX_AI_REQUESTS_PER_SESSION:
+        raise RuntimeError(
+            f"Hai raggiunto il limite di {MAX_AI_REQUESTS_PER_SESSION} "
+            "richieste AI in questa sessione."
+        )
+    st.session_state.ai_requests = used + 1
+
+
+def _is_simple_message(text: str) -> bool:
+    normalized = re.sub(r"[^a-zàèéìòù0-9 ]", "", text.lower()).strip()
+    return normalized in {
+        "ciao", "salve", "buongiorno", "buonasera",
+        "buonanotte", "hey", "grazie", "ok",
+        "okay", "perfetto", "va bene"
+    }
 
 
 def get_connection():
@@ -113,7 +201,6 @@ def get_connection():
 
 
 def get_allowed_tables(force_refresh: bool = False):
-    """Elenco delle tabelle realmente presenti nello schema (whitelist)."""
     global _allowed_tables_cache
     if _allowed_tables_cache is not None and not force_refresh:
         return _allowed_tables_cache
@@ -128,7 +215,6 @@ def get_allowed_tables(force_refresh: bool = False):
 
 
 def get_table_columns(table_name: str):
-    """Colonne reali di una tabella (nome, nullable, tipo), validando il nome tabella."""
     table_name = table_name.upper().strip()
     if table_name not in [t.upper() for t in get_allowed_tables()]:
         raise ValueError(f"Tabella non riconosciuta nel database: {table_name}")
@@ -155,7 +241,6 @@ def get_table_columns(table_name: str):
 
 
 def execute_insert(table_name: str, fields: dict):
-    """Esegue un INSERT parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -187,7 +272,6 @@ def execute_insert(table_name: str, fields: dict):
 
 
 def execute_update(table_name: str, set_fields: dict, where_fields: dict):
-    """Esegue un UPDATE parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -233,8 +317,44 @@ def execute_update(table_name: str, set_fields: dict, where_fields: dict):
         conn.close()
 
 
+def fetch_matching_rows(table_name: str, where_fields: dict, limit: int = 10):
+    """Recupera le righe reali che corrispondono alla condizione, per mostrarle come anteprima prima di modificare/eliminare."""
+    table_name = table_name.upper().strip()
+    columns_info = get_table_columns(table_name)
+    valid_columns = {c["name"] for c in columns_info}
+
+    clean_where = {}
+    for raw_name, raw_value in where_fields.items():
+        name = raw_name.upper().strip()
+        if name not in valid_columns:
+            raise ValueError(f"Colonna non valida per la tabella {table_name}: {raw_name}")
+        clean_where[name] = None if raw_value in (None, "", "NULL", "null") else raw_value
+
+    if not clean_where:
+        raise ValueError("Nessuna condizione specificata.")
+
+    where_cols = list(clean_where.keys())
+    where_clause = " AND ".join(
+        f"{c} IS NULL" if clean_where[c] is None else f"{c} = :{i + 1}"
+        for i, c in enumerate(where_cols)
+    )
+    values = [clean_where[c] for c in where_cols if clean_where[c] is not None]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT * FROM {table_name} WHERE {where_clause} FETCH FIRST {int(limit)} ROWS ONLY",
+            values,
+        )
+        colonne = [d[0] for d in cur.description]
+        righe = cur.fetchall()
+        return colonne, righe
+    finally:
+        conn.close()
+
+
 def count_matching(table_name: str, where_fields: dict) -> int:
-    """Conta quante righe soddisfano una condizione."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -266,7 +386,6 @@ def count_matching(table_name: str, where_fields: dict) -> int:
 
 
 def execute_delete(table_name: str, where_fields: dict):
-    """Esegue un DELETE parametrizzato e sicuro."""
     table_name = table_name.upper().strip()
     columns_info = get_table_columns(table_name)
     valid_columns = {c["name"] for c in columns_info}
@@ -300,11 +419,127 @@ def execute_delete(table_name: str, where_fields: dict):
         conn.close()
 
 
-# =========================================================
-# GEMINI: classificazione intento + estrazione campi
-# =========================================================
+_PAROLE_VIETATE_GRAFICO = ("insert", "update", "delete", "drop", "alter", "truncate", "merge", "grant", "revoke", "create", ";")
+
+
+def genera_query_grafico(domanda: str, tabelle_disponibili: list) -> str:
+    """Chiede al modello una SINGOLA query SELECT di sola lettura, adatta per un grafico (2 colonne: etichetta + valore)."""
+    elenco = ", ".join(tabelle_disponibili)
+    prompt = f"""Sei un assistente Oracle SQL. L'utente vuole un grafico basato su questa richiesta:
+"{domanda}"
+
+Tabelle disponibili: {elenco}
+
+Scrivi UNA SOLA query SQL Oracle di sola lettura (SELECT), che restituisca al massimo 2-3 colonne
+adatte per un grafico: la prima colonna come etichetta/categoria (es. anno, mese, sesso, reparto),
+le successive come valori numerici (es. conteggio, media). Usa GROUP BY e aggregazioni se serve.
+Limita il risultato a un massimo di 50 righe con FETCH FIRST 50 ROWS ONLY.
+
+Rispondi SOLO con la query SQL, senza markdown, senza spiegazioni, senza punto e virgola finale."""
+
+    query = _llm_invoke_cached(prompt).strip()
+    query = re.sub(r"^```(sql)?|```$", "", query, flags=re.MULTILINE).strip().rstrip(";")
+    return query
+
+
+def valida_select_sql(query: str) -> bool:
+    """Permette esclusivamente una singola SELECT di sola lettura."""
+    if not isinstance(query, str):
+        return False
+
+    q = query.strip()
+    q_lower = q.lower()
+
+    if not q_lower.startswith("select"):
+        return False
+
+    # Una sola istruzione, senza commenti SQL.
+    if ";" in q or "--" in q or "/*" in q or "*/" in q:
+        return False
+
+    parole_bloccate = (
+        " insert ", " update ", " delete ", " drop ", " alter ",
+        " truncate ", " merge ", " grant ", " revoke ", " create ",
+        " commit ", " rollback ", " execute ", " begin ", " declare "
+    )
+    padded = f" {q_lower} "
+
+    return not any(parola in padded for parola in parole_bloccate)
+
+
+def esegui_query_sicura_sola_lettura(query: str):
+    """Esegue esclusivamente una SELECT validata."""
+    query = query.strip().rstrip(";").strip()
+
+    if not valida_select_sql(query):
+        raise ValueError("La query generata non è una SELECT di sola lettura consentita.")
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        colonne = [d[0] for d in cur.description]
+        righe = cur.fetchall()
+        return colonne, righe
+    finally:
+        conn.close()
+
+
+def formatta_risultato_query(colonne, righe, query) -> str:
+    """Crea una risposta leggibile senza una seconda chiamata all'AI."""
+    if not righe:
+        testo = "Risultato: nessuna riga trovata."
+    else:
+        testo = f"Risultato: {len(righe)} righe trovate."
+
+    # La tabella completa viene mostrata separatamente dalla UI.
+    # Qui salviamo solo una sintesi + SQL.
+    return f"{testo}\n\n**Query SQL generata:**\n\n```sql\n{query}\n```"
+
+
+def mostra_risultato_query(colonne, righe, query, titolo="Risultato"):
+    """Visualizza tabella e, quando richiesto, anche il grafico."""
+    import pandas as pd
+
+    st.markdown(f"### 📋 {titolo}")
+
+    if colonne:
+        df = pd.DataFrame(righe or [], columns=colonne)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if not df.empty:
+            st.markdown("### 📊 Rappresentazione grafica")
+            df_chart = df.copy()
+
+            for col in df_chart.columns:
+                converted = pd.to_numeric(df_chart[col], errors="coerce")
+                if converted.notna().all():
+                    df_chart[col] = converted
+
+            numeric_cols = list(df_chart.select_dtypes(include="number").columns)
+            categorical_cols = [c for c in df_chart.columns if c not in numeric_cols]
+
+            if numeric_cols:
+                if categorical_cols:
+                    index_col = categorical_cols[0]
+                    chart = df_chart[[index_col] + numeric_cols].head(50).copy()
+                    chart[index_col] = chart[index_col].astype(str)
+                    chart = chart.set_index(index_col)
+                    st.bar_chart(chart, use_container_width=True)
+                elif len(numeric_cols) == 1:
+                    st.bar_chart(df_chart[numeric_cols].head(50), use_container_width=True)
+                else:
+                    st.line_chart(df_chart[numeric_cols].head(50), use_container_width=True)
+            else:
+                st.info("Non ci sono valori numerici sufficienti per creare automaticamente un grafico.")
+
+    with st.expander("🔎 Mostra/nascondi SQL generata"):
+        st.code(query, language="sql")
+
+
+
 def _llm(model=None):
-    return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE, temperature=0)
+    return ChatGoogleGenerativeAI(model=model or MODEL_SIMPLE)
 
 
 def _testo(content):
@@ -316,68 +551,215 @@ def _testo(content):
     return str(content)
 
 
+def _schema_per_prompt(tabelle_disponibili: list) -> str:
+    """Schema compatto usato dalla singola chiamata Gemini."""
+    global _SCHEMA_PROMPT_CACHE
+
+    if _SCHEMA_PROMPT_CACHE is not None:
+        return _SCHEMA_PROMPT_CACHE
+
+    righe = []
+    for tabella in tabelle_disponibili:
+        try:
+            colonne = get_table_columns(tabella)
+            nomi = []
+            for c in colonne:
+                if isinstance(c, dict):
+                    nomi.append(str(c.get("name", "")))
+                else:
+                    nomi.append(str(c))
+            righe.append(f"{tabella}: {', '.join(nomi)}")
+        except Exception:
+            # Se una tabella non è leggibile, manteniamo almeno il nome.
+            righe.append(f"{tabella}: colonne non disponibili")
+
+    _SCHEMA_PROMPT_CACHE = "\n".join(righe)
+    return _SCHEMA_PROMPT_CACHE
+
+
 def analizza_richiesta(domanda: str, tabelle_disponibili: list) -> dict:
-    elenco = ", ".join(tabelle_disponibili)
-    prompt = f"""Sei un assistente che analizza una richiesta in linguaggio naturale su un database
-Oracle di dati clinici cardiologici.
+    """
+    Un'unica chiamata Gemini per ogni richiesta utile.
 
-Tabelle disponibili: {elenco}
+    Per READ/GRAFICO Gemini restituisce anche direttamente la SELECT.
+    In questo modo eliminiamo il vecchio doppio passaggio:
+        analizza_richiesta -> SQL Agent -> Gemini
+    """
+    schema = _schema_per_prompt(tabelle_disponibili)
 
-Richiesta dell'utente: "{domanda}"
+    prompt = f"""Sei il motore Text2SQL di un'applicazione Streamlit che interroga
+un database Oracle di dati clinici.
 
-Rispondi SOLO con un oggetto JSON valido (nessun testo prima o dopo, nessun blocco markdown),
-in questo formato esatto:
+RICHIESTA UTENTE:
+"{domanda}"
+
+SCHEMA ORACLE DISPONIBILE:
+{schema}
+
+Rispondi SOLO con JSON valido, senza markdown e senza testo esterno.
+
+Formato obbligatorio:
 {{
-  "intento": "read" | "insert" | "update" | "delete" | "altro",
+  "intento": "read" | "insert" | "update" | "delete" | "grafico" | "altro",
   "tabella": "NOME_TABELLA_O_NULL",
-  "campi": {{"NOME_COLONNA": "valore", ...}},
-  "where": {{"NOME_COLONNA": "valore", ...}}
+  "campi": {{}},
+  "where": {{}},
+  "solo_domanda": true,
+  "sql": "SELECT ... oppure null"
 }}
 
-Regole:
-- "read": l'utente vuole solo interrogare/leggere dati (ricerche, conteggi, join, statistiche, analisi).
-- "insert": l'utente vuole aggiungere una nuova riga. Usa "campi" per i valori forniti, "where" vuoto.
-- "update": l'utente vuole modificare righe esistenti. Usa "campi" per i nuovi valori, "where" per identificare le righe.
-- "delete": l'utente vuole eliminare righe esistenti. Usa "where" per identificare le righe, "campi" vuoto.
-- "altro": la richiesta NON riguarda questo database (saluti generici, chiacchiere, argomenti non pertinenti).
-- Per "read" imposta comunque "tabella" a null e lascia "campi"/"where" vuoti.
-- Non inventare valori non menzionati dall'utente."""
+REGOLE:
+1. read = richiesta di lettura, ricerca, conteggio, statistica, JOIN o analisi.
+2. grafico = l'utente chiede esplicitamente una rappresentazione grafica,
+   un andamento, un diagramma, un istogramma o una visualizzazione.
+3. insert/update/delete = modifica reale dei dati.
+4. altro = saluti o richieste non pertinenti al database.
+5. Per read e grafico, "sql" DEVE contenere una singola SELECT Oracle valida.
+6. Per insert/update/delete/altro, "sql" deve essere null.
+7. Usa SOLO tabelle e colonne presenti nello schema.
+8. Non inventare nomi di colonne.
+9. Una SELECT deve essere di sola lettura.
+10. Non usare INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, MERGE,
+    GRANT, REVOKE, CREATE, COMMIT o ROLLBACK.
+11. Se l'utente chiede un conteggio, restituisci una query aggregata.
+12. Per un grafico, preferisci 2 colonne: categoria/data + valore numerico.
+13. Per risultati dettagliati molto grandi, usa FETCH FIRST 1000 ROWS ONLY.
+14. Non aggiungere punto e virgola alla SQL.
+15. Non inventare valori per INSERT/UPDATE/DELETE.
+16. "solo_domanda" è true solo quando l'utente chiede quali dati servono,
+    senza chiedere di eseguire una modifica.
 
-    risposta = _llm().invoke(prompt)
-    testo = _testo(risposta.content).strip()
-    testo = re.sub(r"^```(json)?|```$", "", testo, flags=re.MULTILINE).strip()
+Esempio di grafico:
+{{
+  "intento": "grafico",
+  "tabella": null,
+  "campi": {{}},
+  "where": {{}},
+  "solo_domanda": false,
+  "sql": "SELECT ... FROM ... GROUP BY ... ORDER BY ..."
+}}
+"""
+
+    testo = _llm_invoke_cached(prompt, MODEL_SIMPLE).strip()
+    testo = re.sub(r"^```(?:json)?\s*|\s*```$", "", testo, flags=re.IGNORECASE).strip()
+
     try:
         dati = json.loads(testo)
     except json.JSONDecodeError:
-        dati = {}
+        # Tentativo di recupero se il modello ha aggiunto testo attorno al JSON.
+        match = re.search(r"\{.*\}", testo, flags=re.DOTALL)
+        if not match:
+            raise ValueError("Gemini non ha restituito un JSON valido.")
+        dati = json.loads(match.group(0))
 
     intento = str(dati.get("intento", "read")).strip().lower()
-    if intento not in ("read", "insert", "update", "delete", "altro"):
+    if intento not in ("read", "insert", "update", "delete", "grafico", "altro"):
         intento = "read"
+
+    sql = dati.get("sql")
+    if isinstance(sql, str):
+        sql = sql.replace("```sql", "").replace("```", "").strip().rstrip(";").strip()
+    else:
+        sql = None
 
     return {
         "intento": intento,
         "tabella": dati.get("tabella") or None,
         "campi": dati.get("campi", {}) or {},
         "where": dati.get("where", {}) or {},
+        "solo_domanda": bool(dati.get("solo_domanda", False)),
+        "sql": sql,
     }
 
+def descrivi_campi_tabella(tabella: str, colonne: list) -> str:
+    """Genera una descrizione testuale dei campi di una tabella, per rispondere a 'quali dati servono?'."""
+    righe = []
+    for c in colonne:
+        obbligatorio = "obbligatorio" if not c["nullable"] else "facoltativo"
+        righe.append(f"- **{c['name'].lower()}** ({c['type'].lower()}, {obbligatorio})")
+    return f"Per un'operazione sulla tabella **{tabella}**, questi sono i campi disponibili:\n\n" + "\n".join(righe) + \
+        "\n\nDimmi i valori che vuoi usare e preparo l'operazione con conferma prima di eseguirla."
 
-# =========================================================
-# AGENTE DI SOLA LETTURA (SELECT)
-# =========================================================
+
+def genera_risposta_generica(domanda: str) -> str:
+    """Genera una risposta breve e cordiale per richieste non pertinenti al database, invece di un errore o un messaggio fisso."""
+    prompt = f"""Sei l'assistente di un'applicazione per interrogare e gestire un database Oracle
+di dati clinici cardiologici (pazienti, esami, visite, coronarografie, ecc.).
+
+L'utente ha scritto questo messaggio, che non sembra riguardare direttamente il database: "{domanda}"
+
+Rispondi in modo breve, naturale e cordiale in italiano (massimo 2-3 frasi). Se il messaggio è un
+saluto o small talk, rispondi in modo amichevole. Se è una domanda generica a cui puoi rispondere
+con la tua conoscenza generale, dai una risposta utile e concisa. In ogni caso, ricorda con naturalezza
+(senza essere ripetitivo o formale) che puoi anche aiutare con ricerche, statistiche o modifiche
+sul database clinico, nel caso l'utente fosse interessato."""
+
+    return _llm_invoke_cached(prompt).strip()
+
+
 PREFIX_PROMPT = """Sei un agente SQL esperto per un database Oracle, specializzato in dati clinici cardiologici.
 Rispondi sempre in italiano, in modo chiaro e comprensibile anche per un utente non tecnico.
 Sei abilitato SOLO a leggere dati (SELECT), anche con JOIN, aggregazioni, filtri e sotto-query complesse.
-
-REGOLE CRITICHE DI SINTASSI ORACLE SQL:
-1. NON USARE MAI la funzione EXTRACT() per estrarre parti di data (es. EXTRACT(MONTH FROM colonna)).
-2. Usa SEMPRE TO_CHAR() per formattare o estrarre parti di data, convertendo prima con TO_DATE() se la colonna è di tipo stringa.
-   - Esempio corretto per estrarre l'anno: TO_CHAR(TO_DATE(colonna, 'YYYY-MM-DD'), 'YYYY') oppure TO_CHAR(colonna_date, 'YYYY').
-   - Esempio per estrarre il mese: TO_CHAR(colonna_date, 'MM').
-3. Prima di eseguire una query su una tabella, verifica sempre la struttura delle tabelle rilevanti e i tipi reali delle colonne (VARCHAR2, DATE, NUMBER).
-4. Se la domanda è ambigua, fai la scelta più ragionevole e spiega brevemente l'assunzione fatta nella risposta finale.
+Prima di eseguire una query su una tabella, verifica sempre la struttura delle tabelle rilevanti (colonne, tipi).
+Se la domanda è ambigua, fai la scelta più ragionevole e spiega brevemente l'assunzione fatta nella risposta finale.
 """
+
+
+
+def mostra_grafico_da_risultati(colonne, righe):
+    """Mostra i risultati in tabella e, se possibile, anche come grafico."""
+    import pandas as pd
+
+    if not righe or not colonne:
+        st.info("Nessun dato disponibile per la rappresentazione grafica.")
+        return
+
+    df = pd.DataFrame(righe, columns=colonne)
+
+    # Riconosce automaticamente le colonne numeriche.
+    for col in df.columns:
+        converted = pd.to_numeric(df[col], errors="coerce")
+        if converted.notna().all():
+            df[col] = converted
+
+    st.markdown("### 📋 Tabella dei risultati")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    numeric_cols = list(df.select_dtypes(include="number").columns)
+    non_numeric_cols = [c for c in df.columns if c not in numeric_cols]
+
+    if not numeric_cols:
+        st.info("I risultati non contengono valori numerici sufficienti per creare automaticamente un grafico.")
+        return
+
+    st.markdown("### 📊 Rappresentazione grafica")
+
+    # Categoria + valore: grafico a barre.
+    if non_numeric_cols:
+        index_col = non_numeric_cols[0]
+        chart_df = df[[index_col] + numeric_cols].head(50).set_index(index_col)
+        st.bar_chart(chart_df, use_container_width=True)
+
+    # Una sola colonna numerica: barre.
+    elif len(numeric_cols) == 1:
+        chart_df = df[numeric_cols].head(50)
+        st.bar_chart(chart_df, use_container_width=True)
+
+    # Più valori numerici: andamento.
+    else:
+        chart_df = df[numeric_cols].head(50)
+        st.line_chart(chart_df, use_container_width=True)
+
+
+def esegui_e_mostra_grafico(domanda: str, tabelle_disponibili: list):
+    """Genera una SELECT sicura, mostra tabella + grafico e la SQL generata."""
+    query = genera_query_grafico(domanda, tabelle_disponibili)
+    colonne, righe = esegui_query_sicura_sola_lettura(query)
+
+    mostra_grafico_da_risultati(colonne, righe)
+
+    with st.expander("🔎 Mostra/nascondi SQL generata"):
+        st.code(query, language="sql")
 
 
 def estrai_testo_risposta(output):
@@ -401,12 +783,8 @@ def get_read_agent():
         f"oracle+oracledb://{encoded_user}:{encoded_password}@{DSN}"
         f"?config_dir={WALLET_DIR}&wallet_location={WALLET_DIR}&wallet_password={encoded_wallet_password}"
     )
-    db = SQLDatabase.from_uri(
-        connection_string,
-        sample_rows_in_table_info=2,
-        lazy_table_reflection=False,
-    )
-    llm = ChatGoogleGenerativeAI(model=MODEL_AGENT, temperature=0)
+    db = SQLDatabase.from_uri(connection_string, sample_rows_in_table_info=2)
+    llm = ChatGoogleGenerativeAI(model=MODEL_AGENT)
     return create_sql_agent(
         llm=llm,
         db=db,
@@ -417,13 +795,35 @@ def get_read_agent():
     )
 
 
-# =========================================================
-# INTERFACCIA STREAMLIT
-# =========================================================
 st.set_page_config(page_title="Text2SQL - Oracle AI Agent", page_icon="🤖", layout="wide")
 
 st.markdown("""
     <style>
+    /* Riquadri SQL/codice: sfondo bianco e testo nero */
+    [data-testid="stChatMessage"] pre,
+    [data-testid="stChatMessage"] pre code,
+    [data-testid="stChatMessage"] code,
+    [data-testid="stCodeBlock"],
+    [data-testid="stCodeBlock"] pre,
+    [data-testid="stCodeBlock"] code {
+        color: #000000 !important;
+        background-color: #FFFFFF !important;
+    }
+
+    /* Testo nero per tutti i blocchi SQL/codice con sfondo chiaro */
+    [data-testid="stCodeBlock"],
+    [data-testid="stCodeBlock"] pre,
+    [data-testid="stCodeBlock"] code,
+    pre,
+    pre code {
+        color: #000000 !important;
+        background-color: #FFFFFF !important;
+    }
+
+    [data-testid="stDataFrame"] {
+        color: #000000 !important;
+    }
+
     html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] * ,
     [data-testid="stSidebar"], [data-testid="stSidebar"] * {
         color: #000000 !important;
@@ -432,6 +832,13 @@ st.markdown("""
         background-color: #FFFFFF !important;
     }
     [data-testid="stChatMessage"] * { color: #FFFFFF !important; }
+    /* Eccezione: i campi di input dentro le bolle hanno sfondo chiaro, quindi testo nero */
+    [data-testid="stChatMessage"] input,
+    [data-testid="stChatMessage"] textarea,
+    [data-testid="stChatMessage"] select,
+    [data-testid="stChatMessage"] input::placeholder {
+        color: #000000 !important;
+    }
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         flex-direction: row-reverse !important;
         text-align: right !important;
@@ -478,15 +885,23 @@ if "current_chat_id" not in st.session_state:
 if "pending_write" not in st.session_state:
     st.session_state.pending_write = None
 
+if "ai_requests" not in st.session_state:
+    st.session_state.ai_requests = 0
 
-def nuova_chat(messaggio_iniziale):
+if "pending_chart" not in st.session_state:
+    st.session_state.pending_chart = None
+
+
+def nuova_chat(messaggio_iniziale, reset_ai_counter=False):
     new_id = str(uuid.uuid4())
     st.session_state.current_chat_id = new_id
     st.session_state.all_chats[new_id] = [{"role": "assistant", "content": messaggio_iniziale}]
     st.session_state.pending_write = None
+    st.session_state.pending_chart = None
+    if reset_ai_counter:
+        st.session_state.ai_requests = 0
 
 
-# --- SIDEBAR ---
 with st.sidebar:
     st.title("📜 Conversazioni")
 
@@ -496,6 +911,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Storico Chat")
+    st.caption(f"Richieste AI sessione: {st.session_state.get('ai_requests', 0)}/{MAX_AI_REQUESTS_PER_SESSION}")
 
     for cid in reversed(list(st.session_state.all_chats.keys())):
         messages = st.session_state.all_chats[cid]
@@ -522,18 +938,16 @@ with st.sidebar:
                 st.session_state.pending_write = None
             st.rerun()
 
-# --- HEADER ---
 col_head1, col_head2 = st.columns([0.75, 0.25])
 with col_head1:
     st.title("🤖 Text2SQL Assistant")
 with col_head2:
     st.write("")
     if st.button("🛑 Termina Sessione", use_container_width=True):
-        nuova_chat("Sessione precedente terminata. Nuova conversazione avviata!")
+        nuova_chat("Sessione precedente terminata. Nuova conversazione avviata!", reset_ai_counter=True)
         st.rerun()
 
 
-# --- STORICO MESSAGGI ---
 current_messages = st.session_state.all_chats[st.session_state.current_chat_id]
 for idx, msg in enumerate(current_messages):
     with st.chat_message(msg["role"]):
@@ -559,7 +973,6 @@ for idx, msg in enumerate(current_messages):
                 height=35,
             )
 
-# --- CARD DI CONFERMA PER SCRITTURE IN SOSPESO ---
 if st.session_state.pending_write:
     pw = st.session_state.pending_write
     operazione = pw["operation"]
@@ -606,15 +1019,21 @@ if st.session_state.pending_write:
         elif operazione == "update":
             st.warning(f"⚠️ Stai per modificare righe nella tabella **{pw['table']}**. Controlla campi e condizione prima di confermare.")
 
-            st.markdown("**Campi da modificare:**")
+            st.markdown("**Campi da modificare** (lascia vuoto e spunta NULL per azzerare un campo):")
             set_finale = {}
             for name, value in pw["set"].items():
-                val = st.text_input(
-                    name.lower().replace("_", " "),
-                    value=str(value) if value is not None else "",
-                    key=f"set_{name}_{st.session_state.current_chat_id}",
-                )
-                set_finale[name] = val
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    is_null_default = value in (None, "", "NULL", "null")
+                    val = st.text_input(
+                        name.lower().replace("_", " "),
+                        value="" if is_null_default else str(value),
+                        key=f"set_{name}_{st.session_state.current_chat_id}",
+                        disabled=st.session_state.get(f"setnull_{name}_{st.session_state.current_chat_id}", is_null_default),
+                    )
+                with col2:
+                    is_null = st.checkbox("NULL", value=is_null_default, key=f"setnull_{name}_{st.session_state.current_chat_id}")
+                set_finale[name] = None if is_null else val
 
             st.markdown("**Condizione (quali righe modificare):**")
             where_finale = {}
@@ -630,9 +1049,22 @@ if st.session_state.pending_write:
                 st.info("Non ho riconosciuto campi da modificare. Riscrivi la richiesta specificando cosa cambiare.")
             if not pw["where"]:
                 st.info("Non ho riconosciuto una condizione. Riscrivi la richiesta specificando come identificare le righe.")
+            elif all(where_finale.values()):
+                try:
+                    colonne_prev, righe_prev = fetch_matching_rows(pw["table"], where_finale)
+                    if righe_prev:
+                        st.markdown("**Riga/e attualmente nel database (prima della modifica):**")
+                        st.dataframe(
+                            [dict(zip(colonne_prev, r)) for r in righe_prev],
+                            use_container_width=True,
+                        )
+                    else:
+                        st.warning("Nessuna riga corrisponde a questa condizione: verifica i valori inseriti.")
+                except Exception as e:
+                    st.error(f"Impossibile mostrare l'anteprima: {e}")
 
             c1, c2 = st.columns(2)
-            if c1.button("✅ Conferma ed esegui la modifica", use_container_width=True, disabled=not (set_finale and where_finale)):
+            if c1.button("✅ Conferma ed esegui la modifica", use_container_width=True, disabled=not (set_finale and where_finale and all(where_finale.values()))):
                 try:
                     sql, righe = execute_update(pw["table"], set_finale, where_finale)
                     msg = f"{righe} riga/e modificata/e nella tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
@@ -665,6 +1097,13 @@ if st.session_state.pending_write:
                 try:
                     conteggio = count_matching(pw["table"], where_finale)
                     st.warning(f"Questa condizione corrisponde a **{conteggio} riga/e**. Verranno eliminate tutte.")
+                    if conteggio:
+                        colonne_prev, righe_prev = fetch_matching_rows(pw["table"], where_finale)
+                        st.markdown("**Riga/e che verranno eliminate:**")
+                        st.dataframe(
+                            [dict(zip(colonne_prev, r)) for r in righe_prev],
+                            use_container_width=True,
+                        )
                 except Exception as e:
                     st.error(f"Impossibile verificare l'anteprima: {e}")
 
@@ -685,8 +1124,23 @@ if st.session_state.pending_write:
                 st.session_state.pending_write = None
                 st.rerun()
 
-# --- INPUT UTENTE ---
 pending_active = bool(st.session_state.pending_write)
+
+if st.session_state.get("pending_chart"):
+    chart_request = st.session_state.pending_chart
+    try:
+        with st.chat_message("assistant"):
+            mostra_risultato_query(
+                chart_request["colonne"],
+                chart_request["righe"],
+                chart_request["query"],
+                titolo="Risultato + rappresentazione grafica"
+            )
+    except Exception as e:
+        with st.chat_message("assistant"):
+            st.error(f"⚠️ Non sono riuscito a visualizzare il grafico: {e}")
+    finally:
+        st.session_state.pending_chart = None
 
 with st.form(key="chat_form", clear_on_submit=True):
     c_input, c_mic, c_send = st.columns([10, 1, 1])
@@ -744,9 +1198,10 @@ with st.form(key="chat_form", clear_on_submit=True):
                     recognition.onerror = function() { if (btn) btn.classList.remove('recording'); };
                     recognition.onresult = function(e) {
                         var transcript = e.results[0][0].transcript;
-                        var input = window.parent.document.querySelector('input[placeholder="Fai una domanda o chiedi una modifica al database..."]');
+                        var input = window.parent.document.querySelector('input[aria-label="Messaggio"]');
                         if (input) {
-                            input.value = transcript;
+                            const setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
+                            setter.call(input, transcript);
                             input.dispatchEvent(new Event('input', { bubbles: true }));
                         }
                     };
@@ -768,14 +1223,50 @@ if submit and user_msg.strip():
 
     with st.spinner("Elaborazione della richiesta in corso..."):
         try:
+            if _is_simple_message(user_msg):
+                if user_msg.lower().strip() in {"grazie", "ok", "okay", "perfetto", "va bene"}:
+                    risposta = "Di nulla! Sono qui per aiutarti con il database."
+                else:
+                    risposta = "Ciao! Come posso aiutarti con il database Oracle?"
+                current_messages.append({"role": "assistant", "content": risposta})
+                st.rerun()
+
+            _consume_ai_request()
             tabelle = get_allowed_tables()
             analisi = analizza_richiesta(user_msg, tabelle)
             intento = analisi["intento"]
             tabella = analisi["tabella"]
 
             if intento == "altro":
-                risposta = "Non riesco ad elaborare questa richiesta. Posso aiutarti solo con consultazioni e modifiche al database Oracle."
+                # Nessuna seconda chiamata Gemini: per una tesi è sufficiente
+                # una risposta locale, così una richiesta non pertinente consuma
+                # al massimo una sola chiamata (quella del router).
+                risposta = (
+                    "Posso aiutarti a interrogare e gestire il database Oracle "
+                    "usando il linguaggio naturale. Prova a chiedermi, ad esempio, "
+                    "di cercare pazienti, contare record, confrontare dati o "
+                    "visualizzare un grafico."
+                )
                 current_messages.append({"role": "assistant", "content": risposta})
+
+            elif intento == "grafico":
+                query = analisi.get("sql")
+
+                if not query:
+                    raise ValueError("Non è stata generata una query SQL per il grafico.")
+
+                colonne, righe = esegui_query_sicura_sola_lettura(query)
+
+                current_messages.append({
+                    "role": "assistant",
+                    "content": formatta_risultato_query(colonne, righe, query)
+                })
+
+                st.session_state.pending_chart = {
+                    "colonne": colonne,
+                    "righe": righe,
+                    "query": query
+                }
 
             elif intento in ("insert", "update", "delete"):
                 if not tabella or tabella.upper() not in [t.upper() for t in tabelle]:
@@ -808,11 +1299,38 @@ if submit and user_msg.strip():
                         }
 
             else:  # 'read'
-                res = agent.invoke({"input": user_msg})
-                output_text = estrai_testo_risposta(res.get("output", ""))
-                current_messages.append({"role": "assistant", "content": output_text})
+                query = analisi.get("sql")
+
+                if not query:
+                    raise ValueError("Non è stata generata una query SQL per la richiesta.")
+
+                colonne, righe = esegui_query_sicura_sola_lettura(query)
+
+                current_messages.append({
+                    "role": "assistant",
+                    "content": formatta_risultato_query(colonne, righe, query)
+                })
+
+                st.session_state.last_result = {
+                    "colonne": colonne,
+                    "righe": righe,
+                    "query": query,
+                    "grafico": False,
+                }
 
         except Exception as e:
-            current_messages.append({"role": "assistant", "content": f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"})
+            error_text = str(e)
+            if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text or "limite di richieste" in error_text.lower():
+                risposta_errore = (
+                    "⚠️ **Limite Gemini raggiunto.**\n\n"
+                    "La quota API del progetto è temporaneamente esaurita. "
+                    "La richiesta non verrà ritentata automaticamente, così da non consumare "
+                    "ulteriormente la quota. Puoi riprovare quando il limite viene ripristinato "
+                    "oppure aumentare il piano/quota del progetto Google AI."
+                )
+            else:
+                risposta_errore = f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"
+
+            current_messages.append({"role": "assistant", "content": risposta_errore})
 
     st.rerun()
