@@ -15,6 +15,8 @@ import uuid
 import base64
 import zipfile
 import warnings
+import time
+from collections import deque
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -111,8 +113,8 @@ DB_PASSWORD = ORACLE_ADMIN_PASSWORD
 WALLET_PASSWORD = ORACLE_WALLET_PASSWORD
 DSN = "text2sqldb_high"
 
-MODEL_SIMPLE = "gemini-3.5-flash"
-MODEL_AGENT = "gemini-3.5-flash"
+MODEL_SIMPLE = "gemini-2.5-flash-lite"
+MODEL_COMPLEX = "gemini-2.5-flash"
 
 
 _allowed_tables_cache = None
@@ -487,45 +489,122 @@ sul database clinico, nel caso l'utente fosse interessato."""
     return _testo(risposta.content).strip()
 
 
-PREFIX_PROMPT = """Sei un agente SQL esperto per un database Oracle, specializzato in dati clinici cardiologici.
-Rispondi sempre in italiano, in modo chiaro e comprensibile anche per un utente non tecnico.
-Sei abilitato SOLO a leggere dati (SELECT), anche con JOIN, aggregazioni, filtri e sotto-query complesse.
-Prima di eseguire una query su una tabella, verifica sempre la struttura delle tabelle rilevanti (colonne, tipi).
-Se la domanda è ambigua, fai la scelta più ragionevole e spiega brevemente l'assunzione fatta nella risposta finale.
+PREFIX_PROMPT = """Sei un assistente esperto di Oracle SQL per un database clinico cardiologico.
+Rispondi sempre in italiano.
+Il tuo compito è trasformare una richiesta in linguaggio naturale in UNA SOLA query Oracle di sola lettura.
+Sono consentite esclusivamente SELECT, JOIN, aggregazioni, filtri, CASE, sottoquery e CTE.
+NON usare INSERT, UPDATE, DELETE, MERGE, DROP, ALTER, TRUNCATE, GRANT, REVOKE o CREATE.
+Non modificare mai il database.
+Usa esclusivamente le tabelle e le colonne presenti nello schema fornito.
+Non inventare nomi di tabelle o colonne.
+Se la richiesta non è sufficientemente determinata, genera comunque la query più ragionevole possibile.
+La risposta deve essere SOLO JSON valido nel formato:
+{"sql":"SELECT ...","spiegazione":"breve spiegazione in italiano"}.
 """
 
-
-def estrai_testo_risposta(output):
-    if isinstance(output, str):
-        return output
-    if isinstance(output, list):
-        parti = [b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"]
-        if parti:
-            return "\n".join(parti)
-    return str(output)
-
+@st.cache_resource
+def get_read_llm():
+    return ChatGoogleGenerativeAI(model=MODEL_SIMPLE, temperature=0)
 
 @st.cache_resource
-def get_read_agent():
-    from urllib.parse import quote_plus
+def get_complex_llm():
+    return ChatGoogleGenerativeAI(model=MODEL_COMPLEX, temperature=0)
 
-    encoded_user = quote_plus(DB_USER)
-    encoded_password = quote_plus(DB_PASSWORD)
-    encoded_wallet_password = quote_plus(WALLET_PASSWORD)
-    connection_string = (
-        f"oracle+oracledb://{encoded_user}:{encoded_password}@{DSN}"
-        f"?config_dir={WALLET_DIR}&wallet_location={WALLET_DIR}&wallet_password={encoded_wallet_password}"
-    )
-    db = SQLDatabase.from_uri(connection_string, sample_rows_in_table_info=2)
-    llm = ChatGoogleGenerativeAI(model=MODEL_AGENT, temperature=0)
-    return create_sql_agent(
-        llm=llm,
-        db=db,
-        verbose=True,
-        prefix=PREFIX_PROMPT,
-        agent_type="tool-calling",
-        handle_parsing_errors=True,
-    )
+@st.cache_data(ttl=300, show_spinner=False)
+def get_schema_compact():
+    tables = get_allowed_tables()
+    schema = []
+    for table in tables:
+        cols = get_table_columns(table)
+        schema.append({
+            "table": table,
+            "columns": [
+                {"name": c["name"], "type": c["type"], "nullable": c["nullable"]}
+                for c in cols
+            ]
+        })
+    return schema
+
+def _schema_text():
+    return json.dumps(get_schema_compact(), ensure_ascii=False, separators=(",", ":"))
+
+def _is_simple_message(message: str) -> bool:
+    msg = re.sub(r"[!?.,;:]+", "", message.lower().strip())
+    simple = {
+        "ciao", "salve", "buongiorno", "buonasera", "buonanotte",
+        "hey", "ok", "okay", "grazie", "grazie mille"
+    }
+    return msg in simple
+
+def risposta_semplice(message: str):
+    msg = message.lower().strip()
+    if msg in {"grazie", "grazie mille"}:
+        return "Di nulla! Se vuoi, posso aiutarti a interrogare il database."
+    return "Ciao! Posso aiutarti a interrogare e analizzare il database clinico. Cosa vuoi sapere?"
+
+def genera_sql_lettura(domanda: str):
+    schema = _schema_text()
+    prompt = f"""{PREFIX_PROMPT}
+
+SCHEMA DEL DATABASE:
+{schema}
+
+RICHIESTA DELL'UTENTE:
+{domanda}
+"""
+    risposta = get_read_llm().invoke(prompt)
+    raw = _testo(risposta.content).strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback: estrai la prima SELECT dal testo.
+        match = re.search(r"(?is)\bSELECT\b.*", raw)
+        if not match:
+            raise ValueError("Il modello non ha restituito una query SQL valida.")
+        sql = match.group(0).strip().rstrip(";")
+        return sql, ""
+
+    sql = str(data.get("sql", "")).strip().rstrip(";")
+    spiegazione = str(data.get("spiegazione", "")).strip()
+
+    if not sql:
+        raise ValueError("Il modello non ha restituito una query SQL.")
+
+    return sql, spiegazione
+
+def valida_select(sql: str):
+    q = sql.strip().lower()
+    if not q.startswith("select") and not q.startswith("with"):
+        raise ValueError("Sono consentite solo query SELECT.")
+
+    # Evita comandi multipli e operazioni di modifica.
+    if ";" in q:
+        raise ValueError("Sono consentite query singole.")
+    for parola in _PAROLE_VIETATE_GRAFICO:
+        if parola in q:
+            raise ValueError(f"Query non permessa: contiene '{parola}'.")
+
+    # Evita accesso a oggetti non appartenenti allo schema.
+    # La validazione strutturale principale resta affidata allo schema fornito al modello.
+    return sql
+
+@st.cache_data(ttl=30, show_spinner=False)
+def esegui_select_cache(sql: str):
+    sql = valida_select(sql)
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        colonne = [d[0] for d in cur.description]
+        righe = cur.fetchall()
+        return colonne, righe
+    finally:
+        conn.close()
+
+def esegui_select(sql: str):
+    return esegui_select_cache(sql)
 
 
 st.set_page_config(page_title="Text2SQL - Oracle AI Agent", page_icon="🤖", layout="wide")
@@ -575,9 +654,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 try:
-    agent = get_read_agent()
+    # Verifica solo che le credenziali siano disponibili.
+    get_allowed_tables()
 except Exception as e:
-    st.error(f"Errore di connessione al Database o API Gemini: {e}")
+    st.error(f"Errore di connessione al Database: {e}")
     st.stop()
 
 if "all_chats" not in st.session_state:
@@ -592,6 +672,31 @@ if "current_chat_id" not in st.session_state:
 
 if "pending_write" not in st.session_state:
     st.session_state.pending_write = None
+
+# Limite leggero per la demo di tesi.
+# Evita che una singola sessione consumi rapidamente tutta la quota Gemini.
+REQUEST_LIMIT = 30
+REQUEST_WINDOW_SECONDS = 3600
+
+if "request_times" not in st.session_state:
+    st.session_state.request_times = deque()
+
+def richiesta_consentita():
+    now = time.time()
+    while st.session_state.request_times and now - st.session_state.request_times[0] > REQUEST_WINDOW_SECONDS:
+        st.session_state.request_times.popleft()
+
+    if len(st.session_state.request_times) >= REQUEST_LIMIT:
+        return False
+
+    st.session_state.request_times.append(now)
+    return True
+
+def richieste_rimanenti():
+    now = time.time()
+    while st.session_state.request_times and now - st.session_state.request_times[0] > REQUEST_WINDOW_SECONDS:
+        st.session_state.request_times.popleft()
+    return max(0, REQUEST_LIMIT - len(st.session_state.request_times))
 
 
 def nuova_chat(messaggio_iniziale):
@@ -639,6 +744,7 @@ with st.sidebar:
 col_head1, col_head2 = st.columns([0.75, 0.25])
 with col_head1:
     st.title("🤖 Text2SQL Assistant")
+    st.caption(f"Richieste AI disponibili in questa sessione: **{richieste_rimanenti()}/{REQUEST_LIMIT}**")
 with col_head2:
     st.write("")
     if st.button("🛑 Termina Sessione", use_container_width=True):
@@ -670,6 +776,14 @@ for idx, msg in enumerate(current_messages):
                 """,
                 height=35,
             )
+
+if st.session_state.get("last_query_result"):
+    result = st.session_state["last_query_result"]
+    st.markdown("### 📊 Risultato della query")
+    st.dataframe(
+        [dict(zip(result["columns"], row)) for row in result["rows"]],
+        use_container_width=True
+    )
 
 if st.session_state.pending_write:
     pw = st.session_state.pending_write
@@ -704,6 +818,9 @@ if st.session_state.pending_write:
                 try:
                     sql = execute_insert(pw["table"], valori_finali)
                     msg = f"Riga inserita correttamente nella tabella {pw['table']}.\n\nQuery eseguita: `{sql}`"
+                    esegui_select_cache.clear()
+                    esegui_select_cache.clear()
+                    esegui_select_cache.clear()
                     current_messages.append({"role": "assistant", "content": msg})
                 except Exception as e:
                     current_messages.append({"role": "assistant", "content": f"⚠️ Errore durante l'inserimento: {e}"})
@@ -903,53 +1020,58 @@ with st.form(key="chat_form", clear_on_submit=True):
 if submit and user_msg.strip():
     current_messages.append({"role": "user", "content": user_msg})
 
+    # I saluti non consumano richieste AI.
+    if _is_simple_message(user_msg):
+        current_messages.append({"role": "assistant", "content": risposta_semplice(user_msg)})
+        st.rerun()
+
+    # Per una demo di tesi limitiamo il consumo della quota per sessione.
+    if not richiesta_consentita():
+        current_messages.append({
+            "role": "assistant",
+            "content": f"⚠️ Hai raggiunto il limite di {REQUEST_LIMIT} richieste AI nell'ultima ora per questa sessione. "
+                       "Il limite serve a proteggere la quota dell'app durante la demo."
+        })
+        st.rerun()
+
     with st.spinner("Elaborazione della richiesta in corso..."):
         try:
-            tabelle = get_allowed_tables()
-            analisi = analizza_richiesta(user_msg, tabelle)
-            intento = analisi["intento"]
-            tabella = analisi["tabella"]
+            # Una sola chiamata AI per le richieste di lettura.
+            sql, spiegazione = genera_sql_lettura(user_msg)
+            sql = valida_select(sql)
 
-            if intento == "altro":
-                risposta = genera_risposta_generica(user_msg)
-                current_messages.append({"role": "assistant", "content": risposta})
+            colonne, righe = esegui_select(sql)
 
-            elif intento in ("insert", "update", "delete"):
-                if not tabella or tabella.upper() not in [t.upper() for t in tabelle]:
-                    current_messages.append({
-                        "role": "assistant",
-                        "content": f"Non ho identificato una tabella valida per questa operazione. Tabelle disponibili: {', '.join(tabelle)}"
-                    })
-                else:
-                    tabella_real = [t for t in tabelle if t.upper() == tabella.upper()][0]
-                    if intento == "insert":
-                        cols = get_table_columns(tabella_real)
-                        st.session_state.pending_write = {
-                            "operation": "insert",
-                            "table": tabella_real,
-                            "columns": cols,
-                            "provided": analisi["campi"],
-                        }
-                    elif intento == "update":
-                        st.session_state.pending_write = {
-                            "operation": "update",
-                            "table": tabella_real,
-                            "set": analisi["campi"],
-                            "where": analisi["where"],
-                        }
-                    elif intento == "delete":
-                        st.session_state.pending_write = {
-                            "operation": "delete",
-                            "table": tabella_real,
-                            "where": analisi["where"],
-                        }
+            if spiegazione:
+                output_text = spiegazione + "\n\n"
+            else:
+                output_text = ""
 
-            else:  # 'read'
-                res = agent.invoke({"input": user_msg})
-                output_text = estrai_testo_risposta(res.get("output", ""))
-                current_messages.append({"role": "assistant", "content": output_text})
+            output_text += f"**Risultato:** {len(righe)} righe trovate.\n\n"
+
+            if righe:
+                st.session_state[f"result_{len(current_messages)}"] = (
+                    colonne, righe
+                )
+                # Il dataframe viene mostrato tramite un messaggio sintetico;
+                # il risultato viene visualizzato subito sotto.
+                output_text += f"```sql\n{sql}\n```"
+            else:
+                output_text += f"```sql\n{sql}\n```"
+
+            current_messages.append({"role": "assistant", "content": output_text})
+
+            # Mostra il risultato in modo immediato.
+            if righe:
+                st.session_state["last_query_result"] = {
+                    "columns": colonne,
+                    "rows": righe
+                }
 
         except Exception as e:
-            current_messages.append({"role": "assistant", "content": f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"})
+            current_messages.append({
+                "role": "assistant",
+                "content": f"⚠️ Si è verificato un errore durante l'elaborazione: {e}"
+            })
 
     st.rerun()
