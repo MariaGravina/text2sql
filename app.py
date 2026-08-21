@@ -540,35 +540,45 @@ e concreto, con i numeri esatti che vedi nei dati."""
     return _llm_invoke_cached(prompt).strip()
 
 
+def renderizza_grafico(colonne, righe):
+    """Disegna un grafico a barre/linee a partire da colonne+righe di una query. Riutilizzabile ovunque nella cronologia."""
+    import pandas as pd
+
+    if not colonne or not righe:
+        return
+
+    df_chart = pd.DataFrame(righe, columns=colonne)
+    for col in df_chart.columns:
+        converted = pd.to_numeric(df_chart[col], errors="coerce")
+        if converted.notna().all():
+            df_chart[col] = converted
+
+    numeric_cols = list(df_chart.select_dtypes(include="number").columns)
+    categorical_cols = [c for c in df_chart.columns if c not in numeric_cols]
+
+    if not numeric_cols:
+        st.info("Non ci sono valori numerici sufficienti per creare un grafico da questi dati.")
+        return
+
+    if categorical_cols:
+        index_col = categorical_cols[0]
+        chart = df_chart[[index_col] + numeric_cols].head(50).copy()
+        chart[index_col] = chart[index_col].astype(str)
+        chart = chart.set_index(index_col)
+        st.bar_chart(chart, use_container_width=True)
+    elif len(numeric_cols) == 1:
+        st.bar_chart(df_chart[numeric_cols].head(50), use_container_width=True)
+    else:
+        st.line_chart(df_chart[numeric_cols].head(50), use_container_width=True)
+
+
 def mostra_risultato_query(colonne, righe, query, titolo="Risultato"):
     import pandas as pd
 
     if colonne:
         df = pd.DataFrame(righe or [], columns=colonne)
         st.dataframe(df, use_container_width=True, hide_index=True)
-
-        if not df.empty:
-            df_chart = df.copy()
-
-            for col in df_chart.columns:
-                converted = pd.to_numeric(df_chart[col], errors="coerce")
-                if converted.notna().all():
-                    df_chart[col] = converted
-
-            numeric_cols = list(df_chart.select_dtypes(include="number").columns)
-            categorical_cols = [c for c in df_chart.columns if c not in numeric_cols]
-
-            if numeric_cols:
-                if categorical_cols:
-                    index_col = categorical_cols[0]
-                    chart = df_chart[[index_col] + numeric_cols].head(50).copy()
-                    chart[index_col] = chart[index_col].astype(str)
-                    chart = chart.set_index(index_col)
-                    st.bar_chart(chart, use_container_width=True)
-                elif len(numeric_cols) == 1:
-                    st.bar_chart(df_chart[numeric_cols].head(50), use_container_width=True)
-                else:
-                    st.line_chart(df_chart[numeric_cols].head(50), use_container_width=True)
+        renderizza_grafico(colonne, righe)
 
     st.code(query, language="sql")
 
@@ -788,9 +798,16 @@ st.markdown("""
     [data-testid="stChatMessage"] input::placeholder {
         color: #000000 !important;
     }
-    /* I blocchi di codice SQL mantengono il proprio tema scuro con sintassi colorata */
-    [data-testid="stChatMessage"] [data-testid="stCodeBlock"] * {
-        color: initial !important;
+    /* I blocchi di codice SQL: sfondo scuro fisso e testo leggibile, sempre */
+    [data-testid="stChatMessage"] pre,
+    [data-testid="stChatMessage"] pre code,
+    [data-testid="stChatMessage"] code,
+    [data-testid="stCodeBlock"],
+    [data-testid="stCodeBlock"] pre,
+    [data-testid="stCodeBlock"] code {
+        background-color: #0d1117 !important;
+        color: #e6edf3 !important;
+        border-radius: 8px !important;
     }
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         flex-direction: row-reverse !important;
@@ -841,16 +858,12 @@ if "pending_write" not in st.session_state:
 if "ai_requests" not in st.session_state:
     st.session_state.ai_requests = 0
 
-if "pending_chart" not in st.session_state:
-    st.session_state.pending_chart = None
-
 
 def nuova_chat(messaggio_iniziale, reset_ai_counter=False):
     new_id = str(uuid.uuid4())
     st.session_state.current_chat_id = new_id
     st.session_state.all_chats[new_id] = [{"role": "assistant", "content": messaggio_iniziale}]
     st.session_state.pending_write = None
-    st.session_state.pending_chart = None
     if reset_ai_counter:
         st.session_state.ai_requests = 0
 
@@ -910,6 +923,9 @@ for idx, msg in enumerate(current_messages):
             import pandas as pd
             df_storico = pd.DataFrame(msg["table"]["rows"] or [], columns=msg["table"]["columns"])
             st.dataframe(df_storico, use_container_width=True, hide_index=True)
+
+            if msg.get("chart"):
+                renderizza_grafico(msg["table"]["columns"], msg["table"]["rows"])
 
         if msg.get("sql"):
             st.code(msg["sql"], language="sql")
@@ -1088,22 +1104,6 @@ if st.session_state.pending_write:
 
 pending_active = bool(st.session_state.pending_write)
 
-if st.session_state.get("pending_chart"):
-    chart_request = st.session_state.pending_chart
-    try:
-        with st.chat_message("assistant"):
-            mostra_risultato_query(
-                chart_request["colonne"],
-                chart_request["righe"],
-                chart_request["query"],
-                titolo="Risultato + rappresentazione grafica"
-            )
-    except Exception as e:
-        with st.chat_message("assistant"):
-            st.error(f"⚠️ Non sono riuscito a visualizzare il grafico: {e}")
-    finally:
-        st.session_state.pending_chart = None
-
 with st.form(key="chat_form", clear_on_submit=True):
     c_input, c_mic, c_send = st.columns([10, 1, 1])
 
@@ -1223,13 +1223,8 @@ if submit and user_msg.strip():
                     "content": riepilogo,
                     "table": {"columns": colonne, "rows": righe},
                     "sql": query_finale,
+                    "chart": True,
                 })
-
-                st.session_state.pending_chart = {
-                    "colonne": colonne,
-                    "righe": righe,
-                    "query": query_finale
-                }
 
             elif intento in ("insert", "update", "delete"):
                 if not tabella or tabella.upper() not in [t.upper() for t in tabelle]:
