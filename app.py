@@ -601,6 +601,23 @@ def _testo(content):
     return str(content)
 
 
+def get_sample_row(table_name: str):
+    """Recupera una riga di esempio reale da una tabella, per mostrare al modello come sono codificati i valori."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM {table_name} FETCH FIRST 1 ROWS ONLY")
+        colonne = [d[0] for d in cur.description]
+        riga = cur.fetchone()
+        if not riga:
+            return None
+        return dict(zip(colonne, riga))
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def _schema_per_prompt(tabelle_disponibili: list) -> str:
     global _SCHEMA_PROMPT_CACHE
 
@@ -617,7 +634,19 @@ def _schema_per_prompt(tabelle_disponibili: list) -> str:
                     nomi.append(str(c.get("name", "")))
                 else:
                     nomi.append(str(c))
-            righe.append(f"{tabella}: {', '.join(nomi)}")
+            riga_testo = f"{tabella}: {', '.join(nomi)}"
+
+            esempio = get_sample_row(tabella)
+            if esempio:
+                coppie = []
+                for k, v in esempio.items():
+                    valore = "" if v is None else str(v)
+                    if len(valore) > 30:
+                        valore = valore[:30] + "..."
+                    coppie.append(f"{k}={valore}")
+                riga_testo += f"\n  esempio riga reale: {', '.join(coppie)}"
+
+            righe.append(riga_testo)
         except Exception:
             righe.append(f"{tabella}: colonne non disponibili")
 
@@ -677,6 +706,10 @@ REGOLE:
     CLOB direttamente in GROUP BY, ORDER BY o DISTINCT (causa errore ORA-00932
     "inconsistent datatypes... got CLOB"): avvolgi sempre queste colonne con
     TO_CHAR(colonna) quando compaiono in GROUP BY, ORDER BY o DISTINCT.
+19. Per ogni tabella nello schema trovi anche una "esempio riga reale": usala
+    per capire come sono codificati davvero i valori (es. 'S'/'N', 'SI'/'NO',
+    '1'/'0', maiuscolo/minuscolo) prima di scrivere un filtro WHERE. Non
+    indovinare il formato di un valore se puoi dedurlo dall'esempio.
 
 Esempio di grafico:
 {{
