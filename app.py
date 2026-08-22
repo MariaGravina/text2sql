@@ -494,6 +494,11 @@ Correggi la query tenendo conto dell'errore. Ricorda in particolare che:
 - Per calcolare un'età o una differenza in anni tra due date in Oracle, NON usare EXTRACT su un
   numero: usa invece TRUNC(MONTHS_BETWEEN(SYSDATE, TO_DATE(colonna,'YYYY-MM-DD')) / 12).
 - Non usare mai EXTRACT su un valore che non è già di tipo DATE/INTERVAL/TIMESTAMP.
+- In questo database molte colonne testuali (es. sesso, fumo, motivo_decesso, comune_di_nascita)
+  sono di tipo CLOB. Oracle NON permette di usare una colonna CLOB direttamente in GROUP BY,
+  ORDER BY o DISTINCT: se l'errore riguarda "inconsistent datatypes... got CLOB" o simile,
+  avvolgi la colonna con TO_CHAR(colonna) ovunque compaia in GROUP BY, ORDER BY o DISTINCT
+  (il confronto con = in una WHERE di solito invece funziona senza conversione).
 
 Rispondi SOLO con la query SQL corretta, una sola istruzione SELECT, senza markdown, senza
 spiegazioni, senza punto e virgola finale."""
@@ -667,6 +672,11 @@ REGOLE:
 17. Le colonne che rappresentano date sono spesso salvate come testo
     (CLOB/VARCHAR), non come DATE: per confrontarle o calcolare età/intervalli,
     usa TO_DATE(colonna, 'YYYY-MM-DD') e poi MONTHS_BETWEEN/TRUNC invece di EXTRACT.
+18. In questo database molte colonne testuali (es. sesso, fumo, motivo_decesso,
+    comune_di_nascita) sono di tipo CLOB. Oracle non permette di usare una colonna
+    CLOB direttamente in GROUP BY, ORDER BY o DISTINCT (causa errore ORA-00932
+    "inconsistent datatypes... got CLOB"): avvolgi sempre queste colonne con
+    TO_CHAR(colonna) quando compaiono in GROUP BY, ORDER BY o DISTINCT.
 
 Esempio di grafico:
 {{
